@@ -1,0 +1,140 @@
+# ==========================================================
+# Siva Scalping Bot - Main Settings
+# ==========================================================
+# Edit this file to control bot behaviour.
+# For sensitive credentials (API keys, access tokens), edit
+# config/credentials.yaml instead.
+# ==========================================================
+
+mode:
+  # "paper" = simulate trades with live prices, no real orders
+  # "live"  = place real orders via Kite Connect API
+  trading_mode: paper
+
+capital:
+  # Maximum capital allocated for the day (INR)
+  # NO leverage is used. This is your hard cap on premium outflow.
+  daily_budget: 100000
+
+  # Maximum loss allowed per day as % of daily_budget (1% = stop trading)
+  max_daily_loss_pct: 1.0
+
+  # Signal-strength based capital allocation (% of daily_budget per trade)
+  allocation:
+    strong: 30    # all 6 conditions + volume spike >= 1.5x
+    medium: 20    # 5 of 6 conditions met
+    weak: 0       # disabled per user requirement
+
+instrument:
+  # Trading instrument
+  symbol: BANKNIFTY
+  exchange: NFO
+  lot_size: 15
+  max_lots_per_trade: 3
+
+  # Strike selection
+  strike_type: ATM          # ATM | ITM_1 | OTM_1
+  expiry_type: current_week # current_week | next_week | monthly
+
+timeframe:
+  # Primary scalping timeframe
+  primary: 3minute
+  # Positional trend filter (for re-entry check)
+  positional: 15minute
+  # Candles required before first trade (wait for 9:15 candle to complete)
+  warmup_candles: 1
+
+session:
+  market_open:  "09:15"
+  market_close: "15:30"
+  # Square off all positions at this time (10 min before close)
+  square_off_time: "15:20"
+
+indicators:
+  # Intraday (3-min chart)
+  intraday:
+    supertrend:
+      period: 10
+      multiplier: 2
+    rsi:
+      period: 14
+      overbought: 80
+      oversold: 20
+      long_min: 50     # long entry: RSI must be above this
+      short_max: 50    # short entry: RSI must be below this
+    vwap:
+      anchor: session  # resets each trading session
+    psar:
+      acceleration: 0.02
+      max_acceleration: 0.2
+    volume:
+      banknifty_threshold: 50000
+      nifty_threshold: 125000
+
+  # Positional (15-min / hourly) - used for trend filter
+  positional:
+    supertrend:
+      period: 7
+      multiplier: 3
+    rsi:
+      period: 14
+      overbought: 70
+      oversold: 30
+
+trade_rules:
+  # Two Candle Theory confirmation
+  require_consecutive_candles: 2
+  # Cool-down after SL hit (in candle count on primary timeframe)
+  cooldown_candles: 2
+  # Maximum simultaneous positions (0 = unlimited, capital-limited)
+  max_open_positions: 0
+  # Minimum time between trades (seconds) to avoid rapid re-fire
+  min_time_between_trades_sec: 30
+
+stop_loss:
+  # Initial SL = low of first confirmation candle (long) / high (short)
+  # Trailing SL - both rules evaluated, whichever triggers first:
+  trailing:
+    # Rule A: trail by fixed points once in profit
+    enabled: true
+    points_trail_step: 5        # move SL up by 5 pts for every 5 pts gain
+    activation_profit_pts: 5    # start trailing after 5 pts profit
+    # Rule B: exit when SuperTrend flips
+    exit_on_supertrend_flip: true
+
+  # Target profit (1:1 RR per Siva)
+  target_points: 10
+  # Max risk per trade in points (hard ceiling)
+  max_risk_points: 20
+
+gap_protection:
+  # If overnight gap against position exceeds this %, square off immediately
+  gap_threshold_pct: 0.5
+  # If market opens and CMP has already breached SL, square off at market
+  square_off_on_gap_sl_miss: true
+
+re_entry:
+  # After SL, re-enter only if 15-min SuperTrend trend still agrees
+  require_positional_trend_agreement: true
+
+dashboard:
+  # Terminal dashboard refresh interval (seconds)
+  refresh_interval_sec: 1
+  # Max trades shown in the dashboard trade table
+  max_trades_display: 20
+
+logging:
+  # Log levels: DEBUG, INFO, WARNING, ERROR
+  console_level: INFO
+  file_level: DEBUG
+  # Trade log CSV path (relative to project root)
+  trade_log_file: logs/trades.csv
+  # System log file
+  system_log_file: logs/system.log
+
+notifications:
+  # Telegram notifications - to be enabled later
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
