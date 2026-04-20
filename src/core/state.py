@@ -29,10 +29,13 @@ class BotState:
 
         self.last_signal_time: Optional[datetime] = None
         self.last_candle_time: Optional[datetime] = None
+        self.last_tick_time: Optional[datetime] = None
         self.last_error: str = ""
 
         self.underlying_ltp: float = 0.0
         self.atm_strike: float = 0.0
+
+        self.ws_connected: bool = False
 
         self.halted: bool = False
         self.halt_reason: str = ""
@@ -57,9 +60,11 @@ class BotState:
                 "closed_trades": list(self.closed_trades),
                 "last_signal_time": self.last_signal_time,
                 "last_candle_time": self.last_candle_time,
+                "last_tick_time": self.last_tick_time,
                 "last_error": self.last_error,
                 "underlying_ltp": self.underlying_ltp,
                 "atm_strike": self.atm_strike,
+                "ws_connected": self.ws_connected,
                 "halted": self.halted,
                 "halt_reason": self.halt_reason,
             }
