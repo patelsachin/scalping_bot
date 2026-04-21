@@ -37,8 +37,17 @@ class BotState:
 
         self.ws_connected: bool = False
 
+        self.vix: float = 0.0
+        self.market_regime: str = "UNKNOWN"
+
         self.halted: bool = False
         self.halt_reason: str = ""
+
+        # Set to True by the dashboard Q key; engine watches this to trigger graceful shutdown
+        self.shutdown_requested: bool = False
+
+        # Set to True by Ctrl+K; engine squares off all positions and halts (app stays running)
+        self.kill_switch_active: bool = False
 
     # -------------- accessors ------------------
     def snapshot(self) -> dict:
@@ -65,6 +74,8 @@ class BotState:
                 "underlying_ltp": self.underlying_ltp,
                 "atm_strike": self.atm_strike,
                 "ws_connected": self.ws_connected,
+                "vix": self.vix,
+                "market_regime": self.market_regime,
                 "halted": self.halted,
                 "halt_reason": self.halt_reason,
             }

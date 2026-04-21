@@ -10,6 +10,7 @@ from src.core.engine import TradingEngine
 from src.dashboard.terminal_dashboard import run_dashboard
 from src.utils.config_loader import config
 from src.utils.logger import get_logger
+from src.utils.token_watchdog import check_and_warn
 
 log = get_logger(__name__)
 
@@ -39,6 +40,8 @@ def main() -> int:
     args = parse_args()
 
     log.info(f"Python startup. Paper mode: {config.is_paper_mode()}")
+    if not config.is_paper_mode():
+        check_and_warn()   # warn if Kite token is stale before spending time connecting
 
     if args.dashboard_only:
         # Only show dashboard (useful for viewing past state)
@@ -74,7 +77,17 @@ def main() -> int:
     try:
         run_dashboard()
     except KeyboardInterrupt:
-        log.info("Dashboard exited. Shutting down bot.")
+        log.info("Dashboard exited via keyboard interrupt.")
+
+    # run_dashboard() returns when Q is pressed or Ctrl+C is caught.
+    # state.shutdown_requested is already set; give the bot thread up to 10 s
+    # to square off any open positions and exit cleanly.
+    from src.core.state import state as _state
+    _state.shutdown_requested = True
+    log.info("Waiting for bot to square off and exit (max 10 s)...")
+    bot_thread.join(timeout=10)
+    if bot_thread.is_alive():
+        log.warning("Bot thread did not exit in time — forcing process exit.")
 
     return 0
 

@@ -13,6 +13,7 @@ You only need to run this once per trading day.
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -81,9 +82,10 @@ def main() -> int:
 
     current.setdefault("kite", {})
     current["kite"]["access_token"] = access_token
-    current["kite"]["user_id"] = user_id
-    current["kite"]["api_key"] = api_key
-    current["kite"]["api_secret"] = api_secret
+    current["kite"]["token_date"]   = date.today().isoformat()   # for token_watchdog
+    current["kite"]["user_id"]      = user_id
+    current["kite"]["api_key"]      = api_key
+    current["kite"]["api_secret"]   = api_secret
 
     with open(creds_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(current, f, default_flow_style=False)

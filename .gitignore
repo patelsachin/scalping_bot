@@ -34,3 +34,7 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Claude Code worktree directories (isolated work sessions — not source code)
+compassionate-black-3f3d25/
+confident-kepler-127feb/

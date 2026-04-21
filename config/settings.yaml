@@ -49,6 +49,12 @@ session:
   market_close: "15:30"
   # Square off all positions at this time (10 min before close)
   square_off_time: "15:20"
+  # WebSocket lifecycle window
+  # WS starts this many minutes BEFORE market open  (default 09:00 IST)
+  ws_pre_open_minutes: 15
+  # WS auto-stops this many minutes AFTER market close (default 15:45 IST)
+  # By then square-off is done and no new trades can open.
+  ws_post_close_minutes: 15
 
 indicators:
   # Intraday (3-min chart)
@@ -116,6 +122,21 @@ gap_protection:
 re_entry:
   # After SL, re-enter only if 15-min SuperTrend trend still agrees
   require_positional_trend_agreement: true
+
+paper_trading:
+  # Simulated fill slippage in basis points (1 bps = 0.01%).
+  # BUY orders fill slightly higher, SELL slightly lower — mirrors real market impact.
+  # 5 bps on a ₹100 premium = ₹0.05 per unit. Set to 0 to disable.
+  slippage_bps: 5
+
+market_regime:
+  # VIX-based entry gate. Set enabled: false to disable entirely.
+  enabled: true
+  # VIX below this → RANGE regime (no directional momentum) — entries blocked
+  vix_range_max: 13.0
+  # VIX at or above this → VOLATILE regime (premium explosion, SL risk) — entries blocked
+  vix_volatile_min: 25.0
+  # Tip: normal BankNifty scalping conditions are roughly VIX 13–25 (TRENDING)
 
 dashboard:
   # Terminal dashboard refresh interval (seconds)

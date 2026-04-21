@@ -10,6 +10,7 @@ import pandas as pd
 from src.broker.base import BrokerBase
 from src.broker.kite_broker import KiteBroker
 from src.core.models import Trade
+from src.utils.config_loader import config
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -22,6 +23,11 @@ class PaperBroker(BrokerBase):
         self._kite = KiteBroker()
         self._simulated_orders: dict[str, dict] = {}
         self._connected = False
+        # Slippage in basis points (1 bps = 0.01%). Applied on each simulated fill.
+        # BUY fills slightly higher, SELL fills slightly lower — mimics real market impact.
+        self._slippage_bps: float = float(
+            config.get("paper_trading.slippage_bps", 5)
+        )
 
     def connect(self) -> bool:
         # We still need Kite connection to fetch live prices
@@ -82,6 +88,13 @@ class PaperBroker(BrokerBase):
             return self._kite.get_option_symbol(underlying, expiry, strike, option_type)
         return ""
 
+    def _apply_slippage(self, ltp: float, transaction_type: str) -> float:
+        """Apply configurable BPS slippage: BUY fills higher, SELL fills lower."""
+        factor = self._slippage_bps / 10_000.0
+        if transaction_type == "BUY":
+            return round(ltp * (1.0 + factor), 2)
+        return round(ltp * (1.0 - factor), 2)
+
     def place_order(
         self,
         symbol: str,
@@ -90,9 +103,10 @@ class PaperBroker(BrokerBase):
         order_type: str = "MARKET",
         price: Optional[float] = None,
     ) -> str:
-        """Simulate order: use live LTP as fill price."""
+        """Simulate order: fill at LTP ± slippage_bps."""
         order_id = f"PAPER-{uuid4().hex[:8]}"
-        fill_price = price or self.get_ltp(symbol)
+        raw_price = price or self.get_ltp(symbol)
+        fill_price = self._apply_slippage(raw_price, transaction_type)
         self._simulated_orders[order_id] = {
             "order_id": order_id,
             "symbol": symbol,
@@ -104,8 +118,10 @@ class PaperBroker(BrokerBase):
             "status": "COMPLETE",
             "timestamp": datetime.now(),
         }
+        slip_pts = abs(fill_price - raw_price)
         log.info(
-            f"[PAPER] {transaction_type} {symbol} qty={quantity} @ ₹{fill_price:.2f} id={order_id}"
+            f"[PAPER] {transaction_type} {symbol} qty={quantity} "
+            f"@ ₹{fill_price:.2f} (LTP ₹{raw_price:.2f}, slip {slip_pts:.2f}) id={order_id}"
         )
         return order_id
 

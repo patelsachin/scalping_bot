@@ -14,6 +14,7 @@ from rich.text import Text
 from src.core.models import TradeStatus
 from src.core.state import state
 from src.utils.config_loader import config
+from src.utils.trade_stats import cached_stats
 
 
 def _fmt_money(val: float) -> Text:
@@ -41,6 +42,14 @@ def _header_panel(snap: dict) -> Panel:
     status_line.append("  |  ", style="dim")
     status_line.append(f"BANKNIFTY: ₹{snap['underlying_ltp']:,.2f}", style="cyan")
     status_line.append(f"  |  ATM: {int(snap['atm_strike'])}", style="cyan")
+
+    vix = snap.get("vix", 0.0)
+    regime = snap.get("market_regime", "UNKNOWN")
+    if vix > 0:
+        regime_color = {"TRENDING": "green", "RANGE": "yellow", "VOLATILE": "bold red"}.get(regime, "dim")
+        status_line.append("  |  VIX: ", style="dim")
+        status_line.append(f"{vix:.1f} ", style="white")
+        status_line.append(regime, style=regime_color)
 
     if snap["halted"]:
         status_line.append("  |  ", style="dim")
@@ -151,6 +160,40 @@ def _closed_trades_panel(snap: dict) -> Panel:
     return Panel(table, title=f"Closed Trades (last {len(trades)})", border_style="green")
 
 
+def _stats_panel(snap: dict) -> Panel:
+    """Day-stats panel: win rate, expectancy, avg hold, drawdown."""
+    stats = cached_stats.get(snap["closed_trades"])
+
+    table = Table.grid(padding=(0, 2), expand=True)
+    table.add_column(justify="left", style="dim", ratio=1)
+    table.add_column(justify="right", ratio=1)
+
+    win_color = "green" if stats.win_rate_pct >= 50 else "red"
+    exp_color = "green" if stats.expectancy >= 0 else "red"
+
+    table.add_row("Trades", Text(str(stats.total_trades), style="white"))
+    table.add_row(
+        "Win Rate",
+        Text(f"{stats.win_rate_pct:.1f}%", style=win_color),
+    )
+    table.add_row(
+        "Expectancy",
+        Text(f"₹{stats.expectancy:,.2f}", style=exp_color),
+    )
+    table.add_row("Avg Win", _fmt_money(stats.avg_win))
+    table.add_row("Avg Loss", _fmt_money(stats.avg_loss))
+    table.add_row(
+        "Avg Hold",
+        Text(f"{stats.avg_hold_min:.1f} min", style="white"),
+    )
+    table.add_row(
+        "Max DD",
+        Text(f"₹{stats.max_drawdown:,.2f}", style="red" if stats.max_drawdown < 0 else "dim"),
+    )
+
+    return Panel(table, title="Day Stats", border_style="blue")
+
+
 def _footer_panel(snap: dict) -> Panel:
     info_bits: list[str] = []
     if snap["last_candle_time"]:
@@ -160,8 +203,14 @@ def _footer_panel(snap: dict) -> Panel:
     if snap["last_error"]:
         info_bits.append(f"[red]Error: {snap['last_error']}[/red]")
 
-    text = "  |  ".join(info_bits) if info_bits else "Waiting for market activity..."
-    return Panel(Text.from_markup(text, justify="center"), border_style="dim")
+    body = "  |  ".join(info_bits) if info_bits else "Waiting for market activity..."
+    hint = (
+        "[bold yellow][Q][/bold yellow] [dim]Quit & square off all[/dim]"
+        "  |  "
+        "[bold red][Ctrl+K][/bold red] [dim]Kill switch (suspend trading)[/dim]"
+    )
+    text = Text.from_markup(f"{body}\n{hint}", justify="center")
+    return Panel(text, border_style="dim")
 
 
 def build_layout() -> Layout:
@@ -175,6 +224,10 @@ def build_layout() -> Layout:
         Layout(name="left", ratio=1),
         Layout(name="right", ratio=3),
     )
+    layout["left"].split(
+        Layout(name="capital", ratio=3),
+        Layout(name="stats", ratio=2),
+    )
     layout["right"].split(
         Layout(name="open_trades", ratio=1),
         Layout(name="closed_trades", ratio=2),
@@ -185,7 +238,8 @@ def build_layout() -> Layout:
 def render(layout: Layout) -> Layout:
     snap = state.snapshot()
     layout["header"].update(_header_panel(snap))
-    layout["left"].update(_capital_panel(snap))
+    layout["capital"].update(_capital_panel(snap))
+    layout["stats"].update(_stats_panel(snap))
     layout["open_trades"].update(_open_trades_panel(snap))
     layout["closed_trades"].update(_closed_trades_panel(snap))
     layout["footer"].update(_footer_panel(snap))
@@ -193,17 +247,31 @@ def render(layout: Layout) -> Layout:
 
 
 def run_dashboard() -> None:
-    """Blocking call: run the live dashboard. Usually launched in a dedicated thread."""
+    """Blocking call: run the live dashboard. Press Q to quit gracefully."""
+    import msvcrt
+    import time
+
+    from src.core.state import state as _state
+
     refresh = int(config.get("dashboard.refresh_interval_sec", 1))
     console = Console()
     layout = build_layout()
 
     with Live(render(layout), console=console, refresh_per_second=max(1, 1 // max(refresh, 1) if refresh else 4), screen=True) as live:
-        import time
-
         try:
             while True:
                 live.update(render(layout))
+
+                # Non-blocking key check — works on Windows even inside Rich's alternate screen
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key in (b"q", b"Q", b"\x03"):   # Q, q, or Ctrl+C
+                        _state.shutdown_requested = True
+                        break
+                    elif key == b"\x0b":                # Ctrl+K — kill switch
+                        _state.kill_switch_active = True
+                        # Don't break — app stays running; engine will square off + halt
+
                 time.sleep(max(refresh, 1))
         except KeyboardInterrupt:
-            pass
+            _state.shutdown_requested = True

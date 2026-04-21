@@ -13,6 +13,7 @@ A poll-mode fallback is available when WebSocket setup fails.
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta
@@ -25,6 +26,8 @@ from src.broker.kite_broker import KiteBroker
 from src.broker.kite_ticker import TickerManager
 from src.broker.paper_broker import PaperBroker
 from src.core.candle_builder import CandleAggregator
+from src.core.market_regime import MarketRegime, MarketRegimeFilter
+from src.utils.system_logger import sys_log, EVENT_CONNECTED, EVENT_DISCONNECTED, EVENT_HALT, EVENT_KILL_SWITCH, EVENT_STARTUP, EVENT_SHUTDOWN, EVENT_CONFIG_RELOAD
 from src.core.models import (
     ExitReason,
     Signal,
@@ -40,9 +43,12 @@ from src.strategy.two_candle import PositionalTrendFilter, TwoCandleStrategy
 from src.utils.config_loader import config
 from src.utils.logger import get_logger
 from src.utils.market_calendar import (
+    IST,
     is_market_open,
     is_square_off_time,
     is_trading_day,
+    market_close_time,
+    market_open_time,
     now_ist,
 )
 from src.utils.trade_logger import TradeLogger
@@ -76,6 +82,10 @@ class TradingEngine:
         self._cooldown_until: Optional[datetime] = None
         self._last_evaluated_candle: Optional[datetime] = None
 
+        # VIX regime gate
+        self.regime_filter = MarketRegimeFilter()
+        self._vix_token: Optional[int] = None
+
         # WebSocket components
         self._underlying_token: Optional[int] = None
         self._ticker: Optional[TickerManager] = None
@@ -92,6 +102,12 @@ class TradingEngine:
 
         # Prevents two concurrent calls to exit_trade() for the same trade
         self._exit_lock = threading.Lock()
+
+        # COID guard: symbol+direction hash → last order time (F7)
+        self._coid_cache: dict[str, datetime] = {}
+
+        # Kill switch: set True externally (Ctrl+K) → squares off and halts without exiting
+        self._kill_switch_triggered: bool = False
 
         # Signals shutdown to run()
         self._shutdown = threading.Event()
@@ -214,6 +230,21 @@ class TradingEngine:
         symbol, premium = self._build_option_symbol(signal)
         if not symbol or premium <= 0:
             return None
+
+        # F7 — Duplicate order guard (COID)
+        # Prevents the same symbol+direction from firing twice within 60 seconds
+        coid_key  = f"{symbol}:{signal.trade_type.value}"
+        coid_hash = hashlib.md5(coid_key.encode()).hexdigest()[:8]
+        now_ts    = now_ist()
+        with self._engine_lock:
+            last_coid_time = self._coid_cache.get(coid_hash)
+            if last_coid_time and (now_ts - last_coid_time).total_seconds() < 60:
+                log.warning(
+                    f"COID guard: duplicate order for {coid_key} "
+                    f"({(now_ts - last_coid_time).total_seconds():.0f}s ago) — skipped"
+                )
+                return None
+            self._coid_cache[coid_hash] = now_ts
 
         qty, lots, capital_used = self.risk.compute_position_size(
             signal, premium, available
@@ -354,15 +385,44 @@ class TradingEngine:
 
         # Pre-register the underlying token so it's subscribed on connect
         self._ticker.subscribe([self._underlying_token], mode="full")
+
+        # Resolve India VIX token for the regime gate (ltp mode is enough — no volume/OI needed)
+        self._vix_token = self._get_instrument_token("INDIA VIX", "NSE")
+        if self._vix_token:
+            self._ticker.subscribe([self._vix_token], mode="ltp")
+            log.info(f"Subscribed India VIX (token={self._vix_token}) for regime gate")
+        else:
+            log.warning("India VIX token not found — regime gate will be bypassed (fail-open)")
+
         log.info(f"WebSocket configured. Underlying token: {self._underlying_token}")
+        return True
+
+    # ------------------------------------------------------------------
+    # Tick validation (F8)
+    # ------------------------------------------------------------------
+    def _validate_tick(self, tick: dict) -> bool:
+        """Return False for ticks with zero/negative price or stale exchange timestamp."""
+        price = tick.get("last_price", 0.0)
+        if price <= 0:
+            log.debug(f"Tick rejected: price={price} token={tick.get('instrument_token')}")
+            return False
+        raw_ts = tick.get("exchange_timestamp")
+        if isinstance(raw_ts, datetime):
+            ts_naive = raw_ts.replace(tzinfo=None) if raw_ts.tzinfo else raw_ts
+            age_s = (now_ist().replace(tzinfo=None) - ts_naive).total_seconds()
+            if age_s > 3:
+                log.debug(f"Tick rejected: stale {age_s:.1f}s token={tick.get('instrument_token')}")
+                return False
         return True
 
     def _on_ws_connect(self) -> None:
         state.ws_connected = True
+        sys_log.event(EVENT_CONNECTED, "KiteTicker WebSocket connected")
         log.info("WebSocket ready — streaming ticks for underlying index")
 
     def _on_ws_close(self, code: int, reason: str) -> None:
         state.ws_connected = False
+        sys_log.event(EVENT_DISCONNECTED, f"code={code} reason={reason}")
         log.warning(f"WebSocket disconnected ({code}): {reason}")
 
     def _on_ws_error(self, exc: Exception) -> None:
@@ -374,6 +434,8 @@ class TradingEngine:
         state.last_tick_time = now_ist()
 
         for tick in ticks:
+            if not self._validate_tick(tick):   # F8: reject bad ticks early
+                continue
             token: int = tick.get("instrument_token", 0)
             price: float = tick.get("last_price", 0.0)
             # volume_traded is the cumulative day total provided by KiteTicker full/quote modes
@@ -386,6 +448,11 @@ class TradingEngine:
             if token == self._underlying_token:
                 state.underlying_ltp = price
                 self._candle_agg.process_tick(token, price, volume_traded, oi, ts)
+
+            elif self._vix_token and token == self._vix_token:
+                self.regime_filter.update_vix(price)
+                state.vix = price
+                state.market_regime = self.regime_filter.classify().value
 
             elif token in self._option_token_to_trade:
                 self._check_sl_on_tick(token, price)
@@ -430,6 +497,16 @@ class TradingEngine:
         """
         if token != self._underlying_token:
             return
+
+        # F32 — Hot-reload settings.yaml so SL/target tweaks take effect without restart
+        try:
+            config.reload()
+            self.risk.target_points    = float(config.get("stop_loss.target_points", 10))
+            self.risk.max_risk_points  = float(config.get("stop_loss.max_risk_points", 20))
+            self.risk.trail_step       = float(config.get("stop_loss.trailing.points_trail_step", 5))
+            self.risk.trail_activation = float(config.get("stop_loss.trailing.activation_profit_pts", 5))
+        except Exception as _e:
+            log.debug(f"Config hot-reload skipped: {_e}")
 
         # --- Safety checks ---
         if self.risk.is_daily_loss_breached(state.realised_pnl):
@@ -520,6 +597,12 @@ class TradingEngine:
         # --- Strategy evaluation ---
         signal = self.strategy.evaluate(df_snapshot, self.underlying)
         if signal is None or signal.strength == SignalStrength.WEAK:
+            return
+
+        # --- VIX regime gate ---
+        tradeable, regime_reason = self.regime_filter.is_tradeable()
+        if not tradeable:
+            log.info(f"Entry blocked by VIX regime gate: {regime_reason}")
             return
 
         # Re-entry trend filter
@@ -693,7 +776,46 @@ class TradingEngine:
             log.info("Not a trading day. Exiting.")
             return
 
-        # Seed live_df from Kite historical REST API for indicator warmup
+        # ------------------------------------------------------------------
+        # Pre-open wait: hold here until (market_open - ws_pre_open_minutes)
+        # This lets you run daily_start.bat at any time (e.g. 8 AM from the
+        # US) and the bot will self-schedule its WebSocket start.
+        # ------------------------------------------------------------------
+        pre_open_min = int(config.get("session.ws_pre_open_minutes", 15))
+        ws_start_time = (
+            datetime.combine(now_ist().date(), market_open_time(), tzinfo=IST)
+            - timedelta(minutes=pre_open_min)
+        )
+        now = now_ist()
+        if now < ws_start_time:
+            wait_sec = (ws_start_time - now).total_seconds()
+            log.info(
+                f"Started early — WebSocket will begin at "
+                f"{ws_start_time.strftime('%H:%M:%S')} IST "
+                f"({wait_sec / 60:.0f} min from now). Sleeping..."
+            )
+            _last_log_min = -1
+            while not self._shutdown.is_set():
+                remaining = (ws_start_time - now_ist()).total_seconds()
+                if remaining <= 0:
+                    break
+                # Log a countdown line once per minute so you can see it's alive
+                remaining_min = int(remaining // 60)
+                if remaining_min != _last_log_min:
+                    log.info(
+                        f"Pre-market wait: {remaining_min} min until WebSocket start "
+                        f"({ws_start_time.strftime('%H:%M')} IST)."
+                    )
+                    _last_log_min = remaining_min
+                time.sleep(5)
+
+            if self._shutdown.is_set():
+                log.info("Shutdown requested during pre-market wait. Exiting.")
+                return
+            log.info("Pre-market wait complete. Starting WebSocket now.")
+
+        # Seed live_df with historical candles right before WebSocket starts
+        # (done here — not at boot — so we always get the freshest data).
         log.info("Seeding historical candles for indicator warmup...")
         self._live_df = self.prepare_candles(3)
         if self._live_df is None or self._live_df.empty:
@@ -718,15 +840,72 @@ class TradingEngine:
             self._run_poll_fallback(poll_interval_sec)
             return
 
+        sys_log.event(EVENT_STARTUP, f"mode={state.mode} budget={state.daily_budget:.0f}")
         log.info("WebSocket started. Bot is live — waiting for ticks.")
+
+        # Kill-switch watcher: Ctrl+K from dashboard → square off + halt (app stays running)
+        def _kill_switch_watcher() -> None:
+            while not self._shutdown.is_set():
+                if state.kill_switch_active and not self._kill_switch_triggered:
+                    self._kill_switch_triggered = True
+                    log.warning("KILL SWITCH activated — squaring off all positions and suspending.")
+                    sys_log.event(EVENT_KILL_SWITCH, "Manual kill switch triggered via Ctrl+K")
+                    self.square_off_all(ExitReason.MANUAL)
+                    state.halt("Kill switch activated — restart to resume trading")
+                time.sleep(0.3)
+
+        threading.Thread(target=_kill_switch_watcher, daemon=True, name="KillSwitchWatcher").start()
+
+        # Auto-stop watcher: shuts the bot down cleanly N minutes after market close.
+        # No human action needed — if you leave the laptop running the bot will
+        # square off at 15:20, then disconnect the WebSocket at ~15:45 and exit.
+        def _market_close_watcher() -> None:
+            post_close_min = int(config.get("session.ws_post_close_minutes", 15))
+            stop_at = (
+                datetime.combine(now_ist().date(), market_close_time(), tzinfo=IST)
+                + timedelta(minutes=post_close_min)
+            )
+            log.info(
+                f"Market-close watcher active — WebSocket will auto-stop at "
+                f"{stop_at.strftime('%H:%M:%S')} IST."
+            )
+            while not self._shutdown.is_set():
+                if now_ist() >= stop_at:
+                    log.info(
+                        f"Post-close window elapsed ({post_close_min} min after market close). "
+                        f"Signalling shutdown."
+                    )
+                    sys_log.event(
+                        EVENT_SHUTDOWN,
+                        f"Auto-stop: {post_close_min} min post-close window elapsed",
+                    )
+                    self._shutdown.set()
+                    break
+                time.sleep(30)   # 30-second granularity is more than enough here
+
+        threading.Thread(target=_market_close_watcher, daemon=True, name="MarketCloseWatcher").start()
+
+        # Watch state.shutdown_requested in a background thread so the dashboard
+        # Q-key can trigger a graceful shutdown without needing a direct reference
+        # to this engine instance.
+        def _shutdown_watcher() -> None:
+            while not self._shutdown.is_set():
+                if state.shutdown_requested:
+                    log.info("Shutdown requested (Q key). Triggering graceful exit.")
+                    self._shutdown.set()
+                    break
+                time.sleep(0.5)
+
+        threading.Thread(target=_shutdown_watcher, daemon=True, name="ShutdownWatcher").start()
 
         # Block the calling thread until shutdown is signalled
         try:
             self._shutdown.wait()
         except KeyboardInterrupt:
-            pass
+            self._shutdown.set()
         finally:
             log.info("Shutdown signal received. Squaring off all positions.")
+            sys_log.event(EVENT_SHUTDOWN, f"realised_pnl={state.realised_pnl:.2f}")
             self.square_off_all(ExitReason.MANUAL)
             if self._ticker:
                 self._ticker.stop()
