@@ -148,10 +148,16 @@ class TradingEngine:
         symbol = "NIFTY BANK" if self.underlying == "BANKNIFTY" else "NIFTY 50"
         return self.broker.get_historical_candles(symbol, interval, from_dt, to_dt)
 
-    def prepare_candles(self, interval_minutes: int = 3) -> Optional[pd.DataFrame]:
+    def prepare_candles(
+        self,
+        interval_minutes: int = 3,
+        lookback_minutes: Optional[int] = None,
+    ) -> Optional[pd.DataFrame]:
         interval_map = {3: "3minute", 5: "5minute", 15: "15minute", 60: "60minute"}
         interval = interval_map.get(interval_minutes, self.primary_interval)
-        lookback = max(120, interval_minutes * 40)
+        # Default lookback is 40 candles. Override for the initial seed so we always
+        # reach yesterday's session even when starting pre-market (e.g. 08:00 AM).
+        lookback = lookback_minutes if lookback_minutes is not None else max(120, interval_minutes * 40)
         df = self.fetch_candles(interval, lookback)
 
         if df.empty or len(df) < 15:
@@ -529,8 +535,17 @@ class TradingEngine:
         # --- Extend live df and recompute indicators ---
         with self._df_lock:
             if self._live_df is None or self._live_df.empty:
-                log.warning("Live df not seeded yet — skipping candle close processing.")
-                return
+                # Historical seed failed — bootstrap from this first live candle.
+                # Strategy evaluation is gated below by warmup_candles check,
+                # so no trades fire until enough candles have accumulated.
+                new_row = candle.to_frame().T
+                new_row.index.name = "date"
+                self._live_df = new_row
+                log.info(
+                    f"Live df bootstrapped from live candle {candle.name}. "
+                    f"Accumulating candles for indicator warmup..."
+                )
+                return  # Need more candles before indicators can compute
 
             new_row = candle.to_frame().T
             new_row.index.name = "date"
@@ -814,12 +829,16 @@ class TradingEngine:
                 return
             log.info("Pre-market wait complete. Starting WebSocket now.")
 
-        # Seed live_df with historical candles right before WebSocket starts
-        # (done here — not at boot — so we always get the freshest data).
-        log.info("Seeding historical candles for indicator warmup...")
-        self._live_df = self.prepare_candles(3)
+        # Seed live_df with historical candles right before WebSocket starts.
+        # Use a 24-hour lookback so we always reach yesterday's session even when
+        # starting pre-market (default 120-min window is empty before 09:15).
+        log.info("Seeding historical candles for indicator warmup (24h lookback)...")
+        self._live_df = self.prepare_candles(3, lookback_minutes=1440)
         if self._live_df is None or self._live_df.empty:
-            log.warning("Historical candle seed failed. Proceeding with empty buffer.")
+            log.warning(
+                "Historical candle seed failed (Kite API returned no data). "
+                "Bot will self-seed from live ticks once market opens."
+            )
             self._live_df = pd.DataFrame()
         else:
             # Normalise to tz-naive so live candles (also tz-naive) append cleanly

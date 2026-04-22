@@ -74,8 +74,13 @@ indicators:
       acceleration: 0.02
       max_acceleration: 0.2
     volume:
-      banknifty_threshold: 50000
-      nifty_threshold: 125000
+      # KiteTicker does NOT provide volume_traded for NSE indices (BANKNIFTY, NIFTY).
+      # Volume is always 0 on index ticks. Set thresholds to 0 to disable the volume
+      # condition so it doesn't permanently block signals.
+      # Future improvement: subscribe the nearest BankNifty futures contract for
+      # real volume data, then restore these thresholds.
+      banknifty_threshold: 0
+      nifty_threshold: 0
 
   # Positional (15-min / hourly) - used for trend filter
   positional:
