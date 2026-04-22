@@ -71,6 +71,11 @@ class PaperBroker(BrokerBase):
             return self._kite.get_atm_strike(underlying)
         return 0.0
 
+    def get_current_month_futures_symbol(self, underlying: str = "BANKNIFTY") -> Optional[str]:
+        if self._connected:
+            return self._kite.get_current_month_futures_symbol(underlying)
+        return None
+
     def get_current_week_expiry(self, underlying: str = "BANKNIFTY") -> Optional[str]:
         if self._connected:
             return self._kite.get_current_week_expiry(underlying)

@@ -47,6 +47,7 @@ from src.utils.market_calendar import (
     is_market_open,
     is_square_off_time,
     is_trading_day,
+    last_trading_day,
     market_close_time,
     market_open_time,
     now_ist,
@@ -87,7 +88,9 @@ class TradingEngine:
         self._vix_token: Optional[int] = None
 
         # WebSocket components
-        self._underlying_token: Optional[int] = None
+        self._underlying_token: Optional[int] = None  # NSE index — for LTP display / ATM
+        self._futures_symbol: Optional[str] = None    # NFO futures — for candle building (has volume)
+        self._candle_token: Optional[int] = None      # token used for candle building; set to futures if available
         self._ticker: Optional[TickerManager] = None
         self._candle_agg = CandleAggregator(interval_minutes=3)
         self._candle_agg.on_candle_close(self._on_candle_close)
@@ -366,6 +369,121 @@ class TradingEngine:
             self._ticker.unsubscribe([token])
 
     # ------------------------------------------------------------------
+    # Futures resolution + smart historical seed
+    # ------------------------------------------------------------------
+    def _resolve_futures_symbol(self) -> None:
+        """Resolve the nearest-expiry BankNifty futures symbol and instrument token.
+
+        Sets self._futures_symbol and self._candle_token.
+        Falls back gracefully — if futures are unavailable, candle building
+        continues on the index token (no volume, but OHLC still works).
+        """
+        resolve_fn = getattr(self.broker, "get_current_month_futures_symbol", None)
+        if resolve_fn is None:
+            log.warning("Broker does not support futures symbol resolution — index will be used for candles.")
+            return
+
+        self._futures_symbol = resolve_fn(self.underlying)
+        if not self._futures_symbol:
+            log.warning("No active futures contract found — index will be used for candle building (no volume).")
+            return
+
+        self._candle_token = self._get_instrument_token(self._futures_symbol, "NFO")
+        if self._candle_token:
+            log.info(f"Candle token set to futures: {self._futures_symbol} (token={self._candle_token})")
+        else:
+            log.warning(f"Could not resolve token for {self._futures_symbol} — index will be used for candles.")
+            self._futures_symbol = None
+
+    def _smart_seed_candles(self) -> Optional[pd.DataFrame]:
+        """Smart historical seed for indicator warmup.
+
+        Strategy (as requested):
+        - Always: last 45 min of the most recent completed trading session
+          (14:45 – 15:30).  Correctly handles Monday → fetches Friday's tail;
+          no fixed-hour lookback that would fail across weekends.
+        - Additionally when market is currently open: today's session from
+          09:15 to now (so a mid-session restart gets full today context).
+
+        Uses BankNifty futures symbol when available (has real volume).
+        Falls back to the index if futures resolution failed.
+        """
+        from datetime import time as dtime
+
+        ist = IST
+        fetch_symbol: Optional[str] = self._futures_symbol   # None → falls back to index
+
+        prev_day = last_trading_day()                         # Mon→Fri, Tue→Mon, etc.
+
+        # Tail of previous session: 14:45 – 15:30
+        prev_from = datetime.combine(prev_day, dtime(14, 45), tzinfo=ist).replace(tzinfo=None)
+        prev_to   = datetime.combine(prev_day, dtime(15, 30), tzinfo=ist).replace(tzinfo=None)
+
+        frames: list[pd.DataFrame] = []
+
+        df_prev = self._fetch_seed_candles(fetch_symbol, prev_from, prev_to)
+        if df_prev is not None and not df_prev.empty:
+            frames.append(df_prev)
+            log.info(f"Smart seed: {len(df_prev)} candles from {prev_day} (14:45–15:30)")
+        else:
+            log.warning(f"Smart seed: no candles returned for {prev_day} tail — Kite API may be unavailable.")
+
+        # If market is open right now, also include today's session from 09:15 to now
+        if is_market_open():
+            today = now_ist().date()
+            today_from = datetime.combine(today, dtime(9, 15), tzinfo=ist).replace(tzinfo=None)
+            today_to   = now_ist().replace(tzinfo=None)
+            df_today = self._fetch_seed_candles(fetch_symbol, today_from, today_to)
+            if df_today is not None and not df_today.empty:
+                frames.append(df_today)
+                log.info(f"Smart seed: {len(df_today)} candles from today's session (09:15 – now)")
+
+        if not frames:
+            return None
+
+        # Merge, deduplicate, sort chronologically, strip tz
+        df = pd.concat(frames)
+        if hasattr(df.index, "tz") and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+
+        if len(df) < 10:
+            log.warning(f"Smart seed: only {len(df)} candles after merge — insufficient for reliable indicators.")
+            return None
+
+        # Compute indicators on the combined dataset
+        intraday_cfg = config.get("indicators.intraday", {})
+        st_cfg   = intraday_cfg.get("supertrend", {})
+        psar_cfg = intraday_cfg.get("psar", {})
+        df = compute_all_indicators(
+            df,
+            st_period=st_cfg.get("period", 10),
+            st_multiplier=st_cfg.get("multiplier", 2),
+            rsi_period=intraday_cfg.get("rsi", {}).get("period", 14),
+            psar_acc=psar_cfg.get("acceleration", 0.02),
+            psar_max=psar_cfg.get("max_acceleration", 0.2),
+        )
+        state.last_candle_time = df.index[-1].to_pydatetime() if len(df) else None
+        log.info(f"Smart seed complete: {len(df)} candles, indicator warmup ready.")
+        return df
+
+    def _fetch_seed_candles(
+        self,
+        symbol: Optional[str],
+        from_dt: datetime,
+        to_dt: datetime,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch 3-min historical candles for seeding.
+        Uses futures symbol when provided (NFO), falls back to index (NSE).
+        """
+        if symbol:
+            df = self.broker.get_historical_candles(symbol, "3minute", from_dt, to_dt)
+        else:
+            index_sym = "NIFTY BANK" if self.underlying == "BANKNIFTY" else "NIFTY 50"
+            df = self.broker.get_historical_candles(index_sym, "3minute", from_dt, to_dt)
+        return df if df is not None and not df.empty else None
+
+    # ------------------------------------------------------------------
     # WebSocket event handlers
     # ------------------------------------------------------------------
     def _setup_websocket(self) -> bool:
@@ -389,10 +507,24 @@ class TradingEngine:
         self._ticker.on_close(self._on_ws_close)
         self._ticker.on_error(self._on_ws_error)
 
-        # Pre-register the underlying token so it's subscribed on connect
+        # Subscribe index token — used only for live LTP / ATM display
         self._ticker.subscribe([self._underlying_token], mode="full")
 
-        # Resolve India VIX token for the regime gate (ltp mode is enough — no volume/OI needed)
+        # Subscribe futures token for candle building (has real volume).
+        # _futures_symbol / _candle_token were resolved in _resolve_futures_symbol()
+        # before the seed call; just subscribe here.
+        if self._candle_token and self._candle_token != self._underlying_token:
+            self._ticker.subscribe([self._candle_token], mode="full")
+            log.info(
+                f"Subscribed {self._futures_symbol} (token={self._candle_token}) "
+                f"for candle building with real volume"
+            )
+        else:
+            # Fallback: no futures — use index for candles (volume will be 0)
+            self._candle_token = self._underlying_token
+            log.warning("No futures token — index will be used for candle building (no volume).")
+
+        # Resolve India VIX token for the regime gate (ltp mode is enough)
         self._vix_token = self._get_instrument_token("INDIA VIX", "NSE")
         if self._vix_token:
             self._ticker.subscribe([self._vix_token], mode="ltp")
@@ -400,7 +532,10 @@ class TradingEngine:
         else:
             log.warning("India VIX token not found — regime gate will be bypassed (fail-open)")
 
-        log.info(f"WebSocket configured. Underlying token: {self._underlying_token}")
+        log.info(
+            f"WebSocket configured. Index token: {self._underlying_token} | "
+            f"Candle token: {self._candle_token} ({self._futures_symbol or 'index fallback'})"
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -452,7 +587,15 @@ class TradingEngine:
             ts: Optional[datetime] = raw_ts if isinstance(raw_ts, datetime) else None
 
             if token == self._underlying_token:
+                # Index tick: update spot LTP for ATM / dashboard display only.
+                # Candle building is done from futures ticks (below) which carry volume.
                 state.underlying_ltp = price
+                if self._candle_token == self._underlying_token:
+                    # No futures available — fall back to building candles from index
+                    self._candle_agg.process_tick(token, price, volume_traded, oi, ts)
+
+            elif self._candle_token and token == self._candle_token:
+                # Futures tick: primary candle-building source with real volume
                 self._candle_agg.process_tick(token, price, volume_traded, oi, ts)
 
             elif self._vix_token and token == self._vix_token:
@@ -501,7 +644,9 @@ class TradingEngine:
         Extends the live df, recomputes indicators, checks SuperTrend flip
         for open positions, and evaluates new entry signals.
         """
-        if token != self._underlying_token:
+        # Accept candles from the futures token (primary) or index fallback
+        candle_tok = self._candle_token or self._underlying_token
+        if token != candle_tok:
             return
 
         # F32 — Hot-reload settings.yaml so SL/target tweaks take effect without restart
@@ -829,14 +974,17 @@ class TradingEngine:
                 return
             log.info("Pre-market wait complete. Starting WebSocket now.")
 
-        # Seed live_df with historical candles right before WebSocket starts.
-        # Use a 24-hour lookback so we always reach yesterday's session even when
-        # starting pre-market (default 120-min window is empty before 09:15).
-        log.info("Seeding historical candles for indicator warmup (24h lookback)...")
-        self._live_df = self.prepare_candles(3, lookback_minutes=1440)
+        # Resolve futures symbol (needed for both seed and WebSocket).
+        # Done here — after the pre-open wait — so we always get the current contract.
+        self._resolve_futures_symbol()
+
+        # Smart seed: previous session tail (14:45–15:30) + today if market is open.
+        # Uses futures data so seed candles carry real volume.
+        log.info("Seeding historical candles (smart seed)...")
+        self._live_df = self._smart_seed_candles()
         if self._live_df is None or self._live_df.empty:
             log.warning(
-                "Historical candle seed failed (Kite API returned no data). "
+                "Smart seed failed (Kite API returned no data). "
                 "Bot will self-seed from live ticks once market opens."
             )
             self._live_df = pd.DataFrame()
@@ -844,7 +992,6 @@ class TradingEngine:
             # Normalise to tz-naive so live candles (also tz-naive) append cleanly
             if hasattr(self._live_df.index, "tz") and self._live_df.index.tz is not None:
                 self._live_df.index = self._live_df.index.tz_localize(None)
-            log.info(f"Seeded {len(self._live_df)} historical candles.")
 
         self.check_gap_open()
 

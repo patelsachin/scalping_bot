@@ -144,6 +144,30 @@ class KiteBroker(BrokerBase):
         step = 100 if underlying == "BANKNIFTY" else 50
         return round(spot / step) * step
 
+    def get_current_month_futures_symbol(self, underlying: str = "BANKNIFTY") -> Optional[str]:
+        """Return the nearest-expiry futures tradingsymbol for the underlying (e.g. BANKNIFTY25APR25FUT).
+
+        Uses NFO instruments list. Falls back gracefully if not found.
+        """
+        df = self._load_instruments("NFO")
+        if df.empty:
+            return None
+        mask = (df["name"] == underlying) & (df["instrument_type"] == "FUT")
+        futures = df[mask].copy()
+        if futures.empty:
+            log.warning(f"No futures instruments found for {underlying}")
+            return None
+        futures["expiry"] = pd.to_datetime(futures["expiry"])
+        today = pd.Timestamp.now().normalize()
+        upcoming = futures[futures["expiry"] >= today].sort_values("expiry")
+        if upcoming.empty:
+            log.warning(f"No active futures found for {underlying}")
+            return None
+        symbol = str(upcoming.iloc[0]["tradingsymbol"])
+        expiry = upcoming.iloc[0]["expiry"].strftime("%Y-%m-%d")
+        log.info(f"Futures symbol resolved: {symbol} (expiry={expiry})")
+        return symbol
+
     def get_current_week_expiry(self, underlying: str = "BANKNIFTY") -> Optional[str]:
         df = self._load_instruments("NFO")
         if df.empty:

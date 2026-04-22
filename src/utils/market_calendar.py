@@ -69,6 +69,18 @@ def seconds_to_market_open() -> int:
     return int((open_ts - ts).total_seconds())
 
 
+def last_trading_day(reference: date | None = None) -> date:
+    """Return the most recent completed trading weekday before `reference` (default: today IST).
+
+    Correctly handles Monday morning → returns Friday, any other day → yesterday.
+    Does NOT account for NSE holidays (TODO: integrate NSE holiday calendar).
+    """
+    d = (reference or today_ist()) - timedelta(days=1)
+    while d.weekday() >= 5:   # skip Saturday (5) and Sunday (6)
+        d -= timedelta(days=1)
+    return d
+
+
 def candle_start_time(ts: datetime, minutes: int) -> datetime:
     """Return the start time of the N-minute candle containing ts."""
     if ts.tzinfo is None:
