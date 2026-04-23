@@ -61,7 +61,7 @@ indicators:
   intraday:
     supertrend:
       period: 10
-      multiplier: 2
+      multiplier: 3
     rsi:
       period: 14
       overbought: 80
@@ -101,6 +101,13 @@ trade_rules:
   max_open_positions: 0
   # Minimum time between trades (seconds) to avoid rapid re-fire
   min_time_between_trades_sec: 30
+  # Early session filter: skip entry signals before this time (HH:MM IST).
+  # First 15 min after open (09:15-09:30) are pure price discovery — too noisy.
+  no_entry_before: "09:30"
+  # Consecutive loss circuit breaker: pause entries for N candles after this many
+  # consecutive losing trades (SL/flip exits in a row). Resets on a winning trade.
+  max_consecutive_losses: 2
+  consecutive_loss_pause_candles: 6
 
 stop_loss:
   # Initial SL = low of first confirmation candle (long) / high (short)
@@ -109,12 +116,13 @@ stop_loss:
     # Rule A: trail by fixed points once in profit
     enabled: true
     points_trail_step: 5        # move SL up by 5 pts for every 5 pts gain
-    activation_profit_pts: 5    # start trailing after 5 pts profit
+    activation_profit_pts: 10   # start trailing after 10 pts profit (was 5 — too tight on ~₹550 premium)
     # Rule B: exit when SuperTrend flips
     exit_on_supertrend_flip: true
 
-  # Target profit (1:1 RR per Siva)
-  target_points: 10
+  # Target profit: 30 pts gives 1.5:1 R:R against a 20-pt SL.
+  # Minimum to be profitable at ~40% win rate. Do not set below 20.
+  target_points: 30
   # Max risk per trade in points (hard ceiling)
   max_risk_points: 20
 

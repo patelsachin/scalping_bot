@@ -109,6 +109,12 @@ class TradingEngine:
         # COID guard: symbol+direction hash → last order time (F7)
         self._coid_cache: dict[str, datetime] = {}
 
+        # Consecutive loss circuit breaker
+        # Counts back-to-back losing trades; resets on any winning trade.
+        # When it hits max_consecutive_losses the engine blocks entries for N candles.
+        self._consecutive_losses: int = 0
+        self._consec_loss_pause_until: Optional[datetime] = None
+
         # Kill switch: set True externally (Ctrl+K) → squares off and halts without exiting
         self._kill_switch_triggered: bool = False
 
@@ -341,6 +347,26 @@ class TradingEngine:
         trade.exit_quantity = trade.quantity
         trade.exit_reason = reason
         trade.finalise_pnl()
+
+        # Consecutive loss circuit breaker tracking
+        if trade.pnl < 0:
+            self._consecutive_losses += 1
+            max_consec = int(config.get("trade_rules.max_consecutive_losses", 2))
+            pause_candles = int(config.get("trade_rules.consecutive_loss_pause_candles", 6))
+            if self._consecutive_losses >= max_consec:
+                pause_min = pause_candles * 3   # 3-min candles
+                self._consec_loss_pause_until = now_ist() + timedelta(minutes=pause_min)
+                log.warning(
+                    f"Circuit breaker: {self._consecutive_losses} consecutive losses — "
+                    f"entries paused for {pause_min} min "
+                    f"(until {self._consec_loss_pause_until.strftime('%H:%M')} IST)."
+                )
+        else:
+            # Profitable trade — reset streak
+            if self._consecutive_losses > 0:
+                log.info(f"Consecutive loss streak reset (was {self._consecutive_losses}) on winning trade.")
+            self._consecutive_losses = 0
+            self._consec_loss_pause_until = None
 
         state.close_trade(trade)
         self.trade_logger.log_trade(trade)
@@ -754,6 +780,26 @@ class TradingEngine:
         if len(df_snapshot) < self.warmup_candles + 2:
             return
 
+        # --- Early session filter: skip first N minutes after market open ---
+        # Price discovery in 09:15-09:30 is too noisy for reliable signals.
+        # Configured via trade_rules.no_entry_before (HH:MM IST).
+        try:
+            no_entry_before_str = str(config.get("trade_rules.no_entry_before", "09:30"))
+            _ef_hh, _ef_mm = no_entry_before_str.split(":")
+            candle_ts_raw = candle.name
+            if hasattr(candle_ts_raw, "to_pydatetime"):
+                candle_ts_raw = candle_ts_raw.to_pydatetime()
+            candle_hhmm = candle_ts_raw.hour * 60 + candle_ts_raw.minute
+            filter_hhmm = int(_ef_hh) * 60 + int(_ef_mm)
+            if candle_hhmm < filter_hhmm:
+                log.debug(
+                    f"Early session filter: skipping entry at "
+                    f"{candle_ts_raw.strftime('%H:%M')} (no entries before {no_entry_before_str} IST)"
+                )
+                return
+        except Exception:
+            pass  # malformed config — allow entry rather than blocking
+
         # --- Strategy evaluation ---
         signal = self.strategy.evaluate(df_snapshot, self.underlying)
         if signal is None or signal.strength == SignalStrength.WEAK:
@@ -802,6 +848,8 @@ class TradingEngine:
     # ------------------------------------------------------------------
     def in_cooldown(self) -> bool:
         if self._cooldown_until and now_ist() < self._cooldown_until:
+            return True
+        if self._consec_loss_pause_until and now_ist() < self._consec_loss_pause_until:
             return True
         if self._last_trade_time:
             elapsed = (now_ist() - self._last_trade_time).total_seconds()
