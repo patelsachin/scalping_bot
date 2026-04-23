@@ -39,7 +39,8 @@ from src.core.models import (
 from src.core.state import state
 from src.indicators.technical import compute_all_indicators
 from src.risk.risk_manager import RiskManager
-from src.strategy.two_candle import PositionalTrendFilter, TwoCandleStrategy
+from src.strategy.factory import StrategyFactory
+from src.strategy.two_candle import PositionalTrendFilter
 from src.utils.config_loader import config
 from src.utils.logger import get_logger
 from src.utils.market_calendar import (
@@ -61,7 +62,9 @@ class TradingEngine:
     """Main bot. Seeded from Kite historical REST, then driven by KiteTicker WebSocket."""
 
     def __init__(self) -> None:
-        self.strategy = TwoCandleStrategy()
+        # Strategy is loaded FIRST so its timeframe drives the candle aggregator.
+        # Change strategy.type in settings.yaml to switch strategies.
+        self.strategy = StrategyFactory.create()
         self.trend_filter = PositionalTrendFilter()
         self.risk = RiskManager()
         self.trade_logger = TradeLogger()
@@ -69,7 +72,8 @@ class TradingEngine:
 
         self.underlying = config.get("instrument.symbol", "BANKNIFTY")
         self.exchange = config.get("instrument.exchange", "NFO")
-        self.primary_interval = config.get("timeframe.primary", "3minute")
+        # Primary interval is owned by the strategy — not a static config value.
+        self.primary_interval = self.strategy.timeframe_str
         self.positional_interval = config.get("timeframe.positional", "15minute")
         self.warmup_candles = int(config.get("timeframe.warmup_candles", 1))
 
@@ -92,7 +96,8 @@ class TradingEngine:
         self._futures_symbol: Optional[str] = None    # NFO futures — for candle building (has volume)
         self._candle_token: Optional[int] = None      # token used for candle building; set to futures if available
         self._ticker: Optional[TickerManager] = None
-        self._candle_agg = CandleAggregator(interval_minutes=3)
+        # Candle aggregator interval comes from the strategy — switches automatically.
+        self._candle_agg = CandleAggregator(interval_minutes=self.strategy.timeframe_minutes)
         self._candle_agg.on_candle_close(self._on_candle_close)
 
         # Live candle dataframe: seeded from history, extended on each candle close
@@ -159,46 +164,42 @@ class TradingEngine:
 
     def prepare_candles(
         self,
-        interval_minutes: int = 3,
+        interval_minutes: Optional[int] = None,
         lookback_minutes: Optional[int] = None,
     ) -> Optional[pd.DataFrame]:
-        interval_map = {3: "3minute", 5: "5minute", 15: "15minute", 60: "60minute"}
-        interval = interval_map.get(interval_minutes, self.primary_interval)
-        # Default lookback is 40 candles. Override for the initial seed so we always
-        # reach yesterday's session even when starting pre-market (e.g. 08:00 AM).
-        lookback = lookback_minutes if lookback_minutes is not None else max(120, interval_minutes * 40)
+        """Fetch historical candles and compute strategy indicators.
+        Used by the REST-poll fallback path. In WebSocket mode, candles are
+        built by CandleAggregator and indicators computed in _on_candle_close.
+        """
+        # Use strategy's timeframe by default
+        tf_min = interval_minutes or self.strategy.timeframe_minutes
+        interval_map = {1: "1minute", 3: "3minute", 5: "5minute", 15: "15minute", 60: "60minute"}
+        interval = interval_map.get(tf_min, self.primary_interval)
+        lookback = lookback_minutes if lookback_minutes is not None else max(120, tf_min * 40)
         df = self.fetch_candles(interval, lookback)
 
         if df.empty or len(df) < 15:
             log.debug(f"Insufficient candle data for {interval} (got {len(df)}).")
             return None
 
-        intraday_cfg = config.get("indicators.intraday", {})
-        st_cfg = intraday_cfg.get("supertrend", {})
-        psar_cfg = intraday_cfg.get("psar", {})
-
-        df = compute_all_indicators(
-            df,
-            st_period=st_cfg.get("period", 10),
-            st_multiplier=st_cfg.get("multiplier", 2),
-            rsi_period=intraday_cfg.get("rsi", {}).get("period", 14),
-            psar_acc=psar_cfg.get("acceleration", 0.02),
-            psar_max=psar_cfg.get("max_acceleration", 0.2),
-        )
+        df = self.strategy.compute_indicators(df)
         state.last_candle_time = df.index[-1].to_pydatetime() if len(df) else None
         return df
 
     def prepare_positional_candles(self) -> Optional[pd.DataFrame]:
+        """Fetch 15-min candles for the positional trend filter.
+        Uses indicators.positional config — shared across all strategies.
+        """
         df = self.fetch_candles(self.positional_interval, 600)
         if df.empty or len(df) < 10:
             return None
         pos_cfg = config.get("indicators.positional", {})
-        st_cfg = pos_cfg.get("supertrend", {})
+        st_cfg  = pos_cfg.get("supertrend", {})
         return compute_all_indicators(
             df,
-            st_period=st_cfg.get("period", 7),
-            st_multiplier=st_cfg.get("multiplier", 3),
-            rsi_period=pos_cfg.get("rsi", {}).get("period", 14),
+            st_period     = st_cfg.get("period", 7),
+            st_multiplier = st_cfg.get("multiplier", 3),
+            rsi_period    = pos_cfg.get("rsi", {}).get("period", 14),
         )
 
     # ------------------------------------------------------------------
@@ -287,6 +288,7 @@ class TradingEngine:
             underlying=self.underlying,
             trade_type=signal.trade_type,
             signal_strength=signal.strength,
+            strategy=self.strategy.name,          # records which strategy fired this trade
             entry_time=now_ist(),
             entry_price=premium,
             quantity=qty,
@@ -436,33 +438,52 @@ class TradingEngine:
         """
         from datetime import time as dtime
 
-        ist = IST
-        fetch_symbol: Optional[str] = self._futures_symbol   # None → falls back to index
+        ist          = IST
+        fetch_symbol = self._futures_symbol   # None → falls back to index
 
-        prev_day = last_trading_day()                         # Mon→Fri, Tue→Mon, etc.
+        prev_day = last_trading_day()   # Mon→Fri, Tue→Mon, etc.
 
-        # Tail of previous session: 14:45 – 15:30
-        prev_from = datetime.combine(prev_day, dtime(14, 45), tzinfo=ist).replace(tzinfo=None)
-        prev_to   = datetime.combine(prev_day, dtime(15, 30), tzinfo=ist).replace(tzinfo=None)
+        # Fetch the tail of the previous session.
+        # The lookback window is strategy-specific:
+        #   scalping  →  90 min  (14:45 – 15:30 on 3-min → ~30 candles, ample for SuperTrend)
+        #   ichimoku  → 120 min  (13:30 – 15:30 on 1-min → 120 candles, covers Senkou B 52-period)
+        seed_min  = self.strategy.seed_lookback_minutes
+        session_end = dtime(15, 30)
+        prev_from = (
+            datetime.combine(prev_day, session_end, tzinfo=ist)
+            - timedelta(minutes=seed_min)
+        ).replace(tzinfo=None)
+        prev_to = datetime.combine(prev_day, session_end, tzinfo=ist).replace(tzinfo=None)
 
         frames: list[pd.DataFrame] = []
 
         df_prev = self._fetch_seed_candles(fetch_symbol, prev_from, prev_to)
         if df_prev is not None and not df_prev.empty:
             frames.append(df_prev)
-            log.info(f"Smart seed: {len(df_prev)} candles from {prev_day} (14:45–15:30)")
+            start_str = (
+                datetime.combine(prev_day, session_end, tzinfo=ist)
+                - timedelta(minutes=seed_min)
+            ).strftime("%H:%M")
+            log.info(
+                f"Smart seed: {len(df_prev)} candles from {prev_day} "
+                f"({start_str}–15:30, {self.strategy.timeframe_str})"
+            )
         else:
-            log.warning(f"Smart seed: no candles returned for {prev_day} tail — Kite API may be unavailable.")
+            log.warning(
+                f"Smart seed: no candles for {prev_day} tail — Kite API may be unavailable."
+            )
 
         # If market is open right now, also include today's session from 09:15 to now
         if is_market_open():
-            today = now_ist().date()
+            today      = now_ist().date()
             today_from = datetime.combine(today, dtime(9, 15), tzinfo=ist).replace(tzinfo=None)
             today_to   = now_ist().replace(tzinfo=None)
-            df_today = self._fetch_seed_candles(fetch_symbol, today_from, today_to)
+            df_today   = self._fetch_seed_candles(fetch_symbol, today_from, today_to)
             if df_today is not None and not df_today.empty:
                 frames.append(df_today)
-                log.info(f"Smart seed: {len(df_today)} candles from today's session (09:15 – now)")
+                log.info(
+                    f"Smart seed: {len(df_today)} candles from today's session (09:15 – now)"
+                )
 
         if not frames:
             return None
@@ -474,23 +495,18 @@ class TradingEngine:
         df = df[~df.index.duplicated(keep="last")].sort_index()
 
         if len(df) < 10:
-            log.warning(f"Smart seed: only {len(df)} candles after merge — insufficient for reliable indicators.")
+            log.warning(
+                f"Smart seed: only {len(df)} candles after merge — insufficient for reliable indicators."
+            )
             return None
 
-        # Compute indicators on the combined dataset
-        intraday_cfg = config.get("indicators.intraday", {})
-        st_cfg   = intraday_cfg.get("supertrend", {})
-        psar_cfg = intraday_cfg.get("psar", {})
-        df = compute_all_indicators(
-            df,
-            st_period=st_cfg.get("period", 10),
-            st_multiplier=st_cfg.get("multiplier", 2),
-            rsi_period=intraday_cfg.get("rsi", {}).get("period", 14),
-            psar_acc=psar_cfg.get("acceleration", 0.02),
-            psar_max=psar_cfg.get("max_acceleration", 0.2),
-        )
+        # Delegate indicator computation to the active strategy
+        df = self.strategy.compute_indicators(df)
         state.last_candle_time = df.index[-1].to_pydatetime() if len(df) else None
-        log.info(f"Smart seed complete: {len(df)} candles, indicator warmup ready.")
+        log.info(
+            f"Smart seed complete: {len(df)} {self.strategy.timeframe_str} candles | "
+            f"strategy={self.strategy.name} | indicator warmup ready."
+        )
         return df
 
     def _fetch_seed_candles(
@@ -499,14 +515,16 @@ class TradingEngine:
         from_dt: datetime,
         to_dt: datetime,
     ) -> Optional[pd.DataFrame]:
-        """Fetch 3-min historical candles for seeding.
+        """Fetch historical candles for seeding.
+        Uses the active strategy's timeframe string (e.g. '3minute', '1minute').
         Uses futures symbol when provided (NFO), falls back to index (NSE).
         """
+        interval = self.strategy.timeframe_str
         if symbol:
-            df = self.broker.get_historical_candles(symbol, "3minute", from_dt, to_dt)
+            df = self.broker.get_historical_candles(symbol, interval, from_dt, to_dt)
         else:
             index_sym = "NIFTY BANK" if self.underlying == "BANKNIFTY" else "NIFTY 50"
-            df = self.broker.get_historical_candles(index_sym, "3minute", from_dt, to_dt)
+            df = self.broker.get_historical_candles(index_sym, interval, from_dt, to_dt)
         return df if df is not None and not df.empty else None
 
     # ------------------------------------------------------------------
@@ -731,17 +749,9 @@ class TradingEngine:
                 if col in self._live_df.columns:
                     self._live_df[col] = pd.to_numeric(self._live_df[col], errors="coerce").fillna(0.0)
 
-            intraday_cfg = config.get("indicators.intraday", {})
-            st_cfg = intraday_cfg.get("supertrend", {})
-            psar_cfg = intraday_cfg.get("psar", {})
-            df = compute_all_indicators(
-                self._live_df.copy(),
-                st_period=st_cfg.get("period", 10),
-                st_multiplier=st_cfg.get("multiplier", 2),
-                rsi_period=intraday_cfg.get("rsi", {}).get("period", 14),
-                psar_acc=psar_cfg.get("acceleration", 0.02),
-                psar_max=psar_cfg.get("max_acceleration", 0.2),
-            )
+            # Delegate indicator computation to the active strategy.
+            # Switching strategies (scalping ↔ ichimoku) changes this automatically.
+            df = self.strategy.compute_indicators(self._live_df.copy())
             self._live_df = df
             state.last_candle_time = df.index[-1].to_pydatetime()
             df_snapshot = df.copy()
@@ -752,20 +762,16 @@ class TradingEngine:
             f"open_trades={len(state.open_trades)}"
         )
 
-        # --- SuperTrend flip check for open trades (candle-resolution) ---
+        # --- Strategy-driven candle-close exit check ---
+        # Scalping: SuperTrend flip.  Ichimoku: TK cross or cloud re-entry.
+        # Each strategy implements exit_signal() — engine stays strategy-agnostic.
         if not df_snapshot.empty:
-            st_dir = int(df_snapshot.iloc[-1].get("supertrend_dir", 0))
             for trade in list(state.open_trades):
                 if not trade.is_open():
                     continue
-                if self.risk.exit_on_supertrend_flip:
-                    flip_exit: Optional[ExitReason] = None
-                    if trade.trade_type == TradeType.LONG and st_dir == -1:
-                        flip_exit = ExitReason.SUPERTREND_FLIP
-                    elif trade.trade_type == TradeType.SHORT and st_dir == 1:
-                        flip_exit = ExitReason.SUPERTREND_FLIP
-                    if flip_exit:
-                        self.exit_trade(trade, flip_exit)
+                flip_exit = self.strategy.exit_signal(trade, df_snapshot)
+                if flip_exit:
+                    self.exit_trade(trade, flip_exit)
 
         # --- Guard: halt / cooldown ---
         if state.halted or self.in_cooldown():
@@ -866,9 +872,6 @@ class TradingEngine:
             state.update_unrealised(0.0)
             return
 
-        last_candle = primary_df.iloc[-1] if not primary_df.empty else None
-        st_dir = int(last_candle["supertrend_dir"]) if last_candle is not None else None
-
         for trade in list(state.open_trades):
             current_premium = self.broker.get_ltp(trade.symbol)
             if current_premium == 0:
@@ -890,11 +893,9 @@ class TradingEngine:
                 )
             elif current_premium >= trade.target:
                 exit_reason = ExitReason.TARGET_HIT
-            elif self.risk.exit_on_supertrend_flip and st_dir is not None:
-                if trade.trade_type == TradeType.LONG and st_dir == -1:
-                    exit_reason = ExitReason.SUPERTREND_FLIP
-                elif trade.trade_type == TradeType.SHORT and st_dir == 1:
-                    exit_reason = ExitReason.SUPERTREND_FLIP
+            elif not primary_df.empty:
+                # Delegate candle-close exit to strategy (SuperTrend flip / TK cross etc.)
+                exit_reason = self.strategy.exit_signal(trade, primary_df)
 
             if exit_reason:
                 self.exit_trade(trade, exit_reason, exit_price=current_premium)

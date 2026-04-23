@@ -94,6 +94,10 @@ class Trade:
     # Flags
     is_paper: bool = True
 
+    # Strategy that generated this trade — written to CSV for cross-strategy analysis.
+    # Populated by the engine from self.strategy.name at entry time.
+    strategy: str = "scalping"
+
     # Underlying price at entry (for context)
     underlying_entry_price: float = 0.0
     underlying_exit_price: float = 0.0
@@ -145,6 +149,7 @@ class Trade:
             "pnl_points": round(self.pnl_points, 2),
             "status": self.status.value,
             "is_paper": self.is_paper,
+            "strategy": self.strategy,
         }
 
 

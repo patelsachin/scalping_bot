@@ -36,7 +36,7 @@ def vwap(df: pd.DataFrame) -> pd.Series:
         cum_tpv = cum_tpv.reset_index(level=0, drop=True)
 
     vwap_series = cum_tpv / cum_vol.replace(0, np.nan)
-    return vwap_series.fillna(method="ffill").fillna(df["close"])
+    return vwap_series.ffill().fillna(df["close"])
 
 
 def atr(df: pd.DataFrame, period: int = 10) -> pd.Series:
@@ -182,6 +182,106 @@ def psar(
 def volume_avg(series: pd.Series, period: int = 20) -> pd.Series:
     """Rolling average volume."""
     return series.rolling(window=period, min_periods=1).mean()
+
+
+# ===========================================================================
+# Ichimoku Kinko Hyo
+# ===========================================================================
+
+def ichimoku(
+    df: pd.DataFrame,
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+    displacement: int = 26,
+) -> pd.DataFrame:
+    """Ichimoku Kinko Hyo indicator.
+
+    All five classic lines plus several derived columns used by IchimokuStrategy:
+
+    tenkan        Conversion line (fast momentum, tenkan_period midpoint)
+    kijun         Base line (slow "magnet", kijun_period midpoint)
+    senkou_a      Leading Span A shifted forward by displacement (cloud display)
+    senkou_b      Leading Span B shifted forward by displacement (cloud display)
+    cloud_a_now   Senkou A unshifted — used to compare current price vs cloud
+    cloud_b_now   Senkou B unshifted — used to compare current price vs cloud
+    chikou        Lagging span (current close shifted backward by displacement)
+    cloud_color   +1 cloud is green (A > B, bullish), -1 red (B >= A, bearish)
+    price_vs_cloud +1 price above cloud, -1 below, 0 inside
+    kijun_slope   Change in kijun over the last 5 periods (positive = rising)
+    tk_diff       tenkan - kijun (positive = TK bullish alignment)
+    """
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+
+    # Core lines
+    tenkan = (high.rolling(tenkan_period).max() + low.rolling(tenkan_period).min()) / 2
+    kijun  = (high.rolling(kijun_period).max()  + low.rolling(kijun_period).min())  / 2
+
+    # Unshifted spans (for current price-vs-cloud comparison)
+    cloud_a_now = (tenkan + kijun) / 2
+    cloud_b_now = (high.rolling(senkou_b_period).max() + low.rolling(senkou_b_period).min()) / 2
+
+    # Shifted spans (traditional cloud display, 26 periods into the future)
+    senkou_a = cloud_a_now.shift(displacement)
+    senkou_b = cloud_b_now.shift(displacement)
+
+    # Chikou (close plotted 26 periods back)
+    chikou = close.shift(-displacement)
+
+    # Derived: cloud color
+    cloud_color = pd.Series(np.where(cloud_a_now >= cloud_b_now, 1, -1), index=df.index)
+
+    # Derived: price position relative to cloud
+    cloud_top = pd.concat([cloud_a_now, cloud_b_now], axis=1).max(axis=1)
+    cloud_bot = pd.concat([cloud_a_now, cloud_b_now], axis=1).min(axis=1)
+    price_vs_cloud = pd.Series(0, index=df.index, dtype=int)
+    price_vs_cloud[close > cloud_top] = 1
+    price_vs_cloud[close < cloud_bot] = -1
+
+    # Derived: Kijun slope (change over 5 periods — on 1-min chart = 5 min of momentum)
+    kijun_slope = kijun - kijun.shift(5)
+
+    # Derived: TK difference (positive = bullish alignment, negative = bearish)
+    tk_diff = tenkan - kijun
+
+    return pd.DataFrame(
+        {
+            "tenkan":        tenkan,
+            "kijun":         kijun,
+            "senkou_a":      senkou_a,
+            "senkou_b":      senkou_b,
+            "cloud_a_now":   cloud_a_now,
+            "cloud_b_now":   cloud_b_now,
+            "chikou":        chikou,
+            "cloud_color":   cloud_color,
+            "price_vs_cloud": price_vs_cloud,
+            "kijun_slope":   kijun_slope,
+            "tk_diff":       tk_diff,
+        },
+        index=df.index,
+    )
+
+
+def compute_ichimoku_indicators(
+    df: pd.DataFrame,
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+    displacement: int = 26,
+    volume_avg_period: int = 20,
+) -> pd.DataFrame:
+    """Add Ichimoku + volume columns to df. Entry point for IchimokuStrategy."""
+    if df.empty:
+        return df
+    out = df.copy()
+    ichi = ichimoku(out, tenkan_period, kijun_period, senkou_b_period, displacement)
+    out = pd.concat([out, ichi], axis=1)
+    out["volume_avg"]   = volume_avg(out["volume"], volume_avg_period)
+    out["volume_ratio"] = out["volume"] / out["volume_avg"].replace(0, np.nan)
+    out["volume_ratio"] = out["volume_ratio"].fillna(1.0)
+    return out
 
 
 def compute_all_indicators(

@@ -11,6 +11,20 @@ mode:
   # "live"  = place real orders via Kite Connect API
   trading_mode: paper
 
+# ----------------------------------------------------------
+# Strategy selection
+# ----------------------------------------------------------
+# Change this ONE line to switch strategies. Each strategy
+# declares its own candle timeframe, indicator parameters
+# and exit rules. Everything else (risk, execution, logging)
+# stays identical so results are directly comparable.
+#
+#   scalping  → Two Candle Theory (SuperTrend, RSI, VWAP, PSAR) — 3-min chart
+#   ichimoku  → Ichimoku Kinko Hyo (cloud, TK cross, Kijun magnet) — 1-min chart
+# ----------------------------------------------------------
+strategy:
+  type: scalping   # scalping | ichimoku
+
 capital:
   # Maximum capital allocated for the day (INR)
   # NO leverage is used. This is your hard cap on premium outflow.
@@ -37,12 +51,11 @@ instrument:
   expiry_type: current_week # current_week | next_week | monthly
 
 timeframe:
-  # Primary scalping timeframe
-  primary: 3minute
-  # Positional trend filter (for re-entry check)
-  positional: 15minute
-  # Candles required before first trade (wait for 9:15 candle to complete)
-  warmup_candles: 1
+  # NOTE: the primary candle timeframe is now declared by each strategy
+  # (scalping.timeframe / ichimoku.timeframe). This section keeps only
+  # the shared positional-filter and warmup settings.
+  positional: 15minute        # 15-min chart used by the positional trend filter
+  warmup_candles: 1           # completed candles required before first entry
 
 session:
   market_open:  "09:15"
@@ -50,39 +63,77 @@ session:
   # Square off all positions at this time (10 min before close)
   square_off_time: "15:20"
   # WebSocket lifecycle window
-  # WS starts this many minutes BEFORE market open  (default 09:00 IST)
-  ws_pre_open_minutes: 15
-  # WS auto-stops this many minutes AFTER market close (default 15:45 IST)
-  # By then square-off is done and no new trades can open.
-  ws_post_close_minutes: 15
+  ws_pre_open_minutes: 15     # WS starts this many minutes BEFORE market open  (09:00 IST)
+  ws_post_close_minutes: 15   # WS auto-stops this many minutes AFTER close     (15:45 IST)
 
+# ----------------------------------------------------------
+# Scalping strategy parameters  (used when strategy.type = scalping)
+# ----------------------------------------------------------
+scalping:
+  timeframe: 3minute   # candle interval for candle aggregator + historical seed
+
+  supertrend:
+    period: 10
+    multiplier: 3      # was 2 — increased to reduce whipsaws (Siva methodology)
+
+  rsi:
+    period: 14
+    overbought: 80
+    oversold: 20
+    long_min: 50       # long entry: RSI must be >= this
+    short_max: 50      # short entry: RSI must be <= this
+
+  vwap:
+    anchor: session    # resets each trading session at 09:15
+
+  psar:
+    acceleration: 0.02
+    max_acceleration: 0.2
+
+  volume:
+    # KiteTicker does NOT provide volume_traded for NSE indices.
+    # We subscribe the nearest BankNifty futures contract for real volume.
+    # Set to 0 to treat volume filter as always-passed (disable it).
+    banknifty_threshold: 0
+    nifty_threshold: 0
+
+# ----------------------------------------------------------
+# Ichimoku strategy parameters  (used when strategy.type = ichimoku)
+# ----------------------------------------------------------
+ichimoku:
+  timeframe: 1minute   # 1-min chart — same CandleAggregator, different interval
+
+  # Classic Ichimoku periods (designed for daily charts; work on 1-min for intraday)
+  tenkan_period:   9    # Conversion line (fast)
+  kijun_period:   26    # Base line (slow "magnet")
+  senkou_b_period: 52   # Leading Span B period
+  displacement:   26    # Forward shift for cloud display (also Chikou lookback)
+
+  # Kijun magnet filter (Discussion C key insight):
+  # When Kijun is flat, price is in equilibrium and will snap back — don't trade away from it.
+  # Slope is measured as % change in Kijun over last 5 candles.
+  # If abs(slope) < kijun_flat_tolerance_pct of Kijun value → considered flat → entry blocked.
+  require_kijun_slope: true
+  kijun_flat_tolerance_pct: 0.05   # 0.05% tolerance
+
+  # Price must be above or below the cloud (not inside) for a trade to fire.
+  # Inside the cloud = ambiguous/uncertain — Ichimoku's "no man's land".
+  require_price_outside_cloud: true
+
+  # Minimum volume ratio (current / 20-candle avg) for entry confirmation.
+  # Set to 1.0 to require at-least-average volume; 0.0 to disable.
+  min_volume_ratio: 1.0
+
+  volume:
+    banknifty_threshold: 0   # absolute threshold (0 = use min_volume_ratio instead)
+    nifty_threshold: 0
+
+# ----------------------------------------------------------
+# Positional trend filter — shared across ALL strategies
+# ----------------------------------------------------------
+# Used for re-entry validation after a stop-loss: the 15-min SuperTrend
+# must agree with the intended trade direction before re-entering.
 indicators:
-  # Intraday (3-min chart)
-  intraday:
-    supertrend:
-      period: 10
-      multiplier: 3
-    rsi:
-      period: 14
-      overbought: 80
-      oversold: 20
-      long_min: 50     # long entry: RSI must be above this
-      short_max: 50    # short entry: RSI must be below this
-    vwap:
-      anchor: session  # resets each trading session
-    psar:
-      acceleration: 0.02
-      max_acceleration: 0.2
-    volume:
-      # KiteTicker does NOT provide volume_traded for NSE indices (BANKNIFTY, NIFTY).
-      # Volume is always 0 on index ticks. Set thresholds to 0 to disable the volume
-      # condition so it doesn't permanently block signals.
-      # Future improvement: subscribe the nearest BankNifty futures contract for
-      # real volume data, then restore these thresholds.
-      banknifty_threshold: 0
-      nifty_threshold: 0
-
-  # Positional (15-min / hourly) - used for trend filter
   positional:
     supertrend:
       period: 7
@@ -110,15 +161,11 @@ trade_rules:
   consecutive_loss_pause_candles: 6
 
 stop_loss:
-  # Initial SL = low of first confirmation candle (long) / high (short)
-  # Trailing SL - both rules evaluated, whichever triggers first:
   trailing:
-    # Rule A: trail by fixed points once in profit
     enabled: true
-    points_trail_step: 5        # move SL up by 5 pts for every 5 pts gain
-    activation_profit_pts: 10   # start trailing after 10 pts profit (was 5 — too tight on ~₹550 premium)
-    # Rule B: exit when SuperTrend flips
-    exit_on_supertrend_flip: true
+    points_trail_step: 5        # move SL by 5 pts for every 5 pts gain
+    activation_profit_pts: 10   # start trailing after 10 pts profit
+    exit_on_supertrend_flip: true  # scalping: SuperTrend flip | ichimoku: TK cross / cloud re-entry
 
   # Target profit: 30 pts gives 1.5:1 R:R against a 20-pt SL.
   # Minimum to be profitable at ~40% win rate. Do not set below 20.
@@ -127,47 +174,31 @@ stop_loss:
   max_risk_points: 20
 
 gap_protection:
-  # If overnight gap against position exceeds this %, square off immediately
   gap_threshold_pct: 0.5
-  # If market opens and CMP has already breached SL, square off at market
   square_off_on_gap_sl_miss: true
 
 re_entry:
-  # After SL, re-enter only if 15-min SuperTrend trend still agrees
   require_positional_trend_agreement: true
 
 paper_trading:
-  # Simulated fill slippage in basis points (1 bps = 0.01%).
-  # BUY orders fill slightly higher, SELL slightly lower — mirrors real market impact.
-  # 5 bps on a ₹100 premium = ₹0.05 per unit. Set to 0 to disable.
   slippage_bps: 5
 
 market_regime:
-  # VIX-based entry gate. Set enabled: false to disable entirely.
   enabled: true
-  # VIX below this → RANGE regime (no directional momentum) — entries blocked
   vix_range_max: 13.0
-  # VIX at or above this → VOLATILE regime (premium explosion, SL risk) — entries blocked
   vix_volatile_min: 25.0
-  # Tip: normal BankNifty scalping conditions are roughly VIX 13–25 (TRENDING)
 
 dashboard:
-  # Terminal dashboard refresh interval (seconds)
   refresh_interval_sec: 1
-  # Max trades shown in the dashboard trade table
   max_trades_display: 20
 
 logging:
-  # Log levels: DEBUG, INFO, WARNING, ERROR
   console_level: INFO
   file_level: DEBUG
-  # Trade log CSV path (relative to project root)
   trade_log_file: logs/trades.csv
-  # System log file
   system_log_file: logs/system.log
 
 notifications:
-  # Telegram notifications - to be enabled later
   telegram:
     enabled: false
     bot_token: ""

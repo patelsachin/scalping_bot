@@ -1,4 +1,4 @@
-"""Two Candle Theory - core signal generation engine.
+"""Two Candle Theory - core signal generation engine (scalping strategy).
 
 Based on Sivakumar Jayachandran's scalping system.
 
@@ -17,6 +17,8 @@ SHORT signal:
   - Price below VWAP
   - SuperTrend red (direction = -1)
   - PSAR dots above candle (dir = -1)
+
+Exit: SuperTrend direction flip on candle close.
 """
 from __future__ import annotations
 
@@ -25,25 +27,89 @@ from typing import Optional
 
 import pandas as pd
 
-from src.core.models import Signal, SignalStrength, TradeType
+from src.core.models import ExitReason, Signal, SignalStrength, Trade, TradeType
+from src.indicators.technical import compute_all_indicators
+from src.strategy.base import StrategyBase
 from src.utils.config_loader import config
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+_INTERVAL_MAP = {
+    "1minute": 1, "3minute": 3, "5minute": 5,
+    "15minute": 15, "60minute": 60,
+}
 
-class TwoCandleStrategy:
+
+class TwoCandleStrategy(StrategyBase):
     """Evaluates the Two Candle Theory on a candle dataframe."""
 
-    def __init__(self) -> None:
-        ind = config.get("indicators.intraday", {})
-        self.rsi_overbought = ind.get("rsi", {}).get("overbought", 80)
-        self.rsi_oversold = ind.get("rsi", {}).get("oversold", 20)
-        self.rsi_long_min = ind.get("rsi", {}).get("long_min", 50)
-        self.rsi_short_max = ind.get("rsi", {}).get("short_max", 50)
+    # ------------------------------------------------------------------
+    # StrategyBase interface
+    # ------------------------------------------------------------------
+    @property
+    def name(self) -> str:
+        return "scalping"
 
-        self.vol_threshold_bn = ind.get("volume", {}).get("banknifty_threshold", 50000)
-        self.vol_threshold_nifty = ind.get("volume", {}).get("nifty_threshold", 125000)
+    @property
+    def timeframe_minutes(self) -> int:
+        tf = config.get("scalping.timeframe", "3minute")
+        return _INTERVAL_MAP.get(tf, 3)
+
+    @property
+    def seed_lookback_minutes(self) -> int:
+        return 90  # ~30 candles on 3-min — ample for SuperTrend / PSAR warmup
+
+    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute SuperTrend, RSI, VWAP, PSAR and volume averages."""
+        cfg      = config.get("scalping", {})
+        st_cfg   = cfg.get("supertrend", {})
+        psar_cfg = cfg.get("psar", {})
+        rsi_cfg  = cfg.get("rsi", {})
+        return compute_all_indicators(
+            df,
+            st_period     = int(st_cfg.get("period", 10)),
+            st_multiplier = float(st_cfg.get("multiplier", 3)),
+            rsi_period    = int(rsi_cfg.get("period", 14)),
+            psar_acc      = float(psar_cfg.get("acceleration", 0.02)),
+            psar_max      = float(psar_cfg.get("max_acceleration", 0.2)),
+        )
+
+    def exit_signal(self, trade: Trade, df: pd.DataFrame) -> Optional[ExitReason]:
+        """Exit when SuperTrend flips against the open trade direction."""
+        if not config.get("stop_loss.trailing.exit_on_supertrend_flip", True):
+            return None
+        if df.empty:
+            return None
+
+        st_dir = int(df.iloc[-1].get("supertrend_dir", 0))
+        if trade.trade_type == TradeType.LONG and st_dir == -1:
+            log.info(f"SuperTrend flip exit triggered for {trade.trade_id} (LONG → bearish)")
+            return ExitReason.SUPERTREND_FLIP
+        if trade.trade_type == TradeType.SHORT and st_dir == 1:
+            log.info(f"SuperTrend flip exit triggered for {trade.trade_id} (SHORT → bullish)")
+            return ExitReason.SUPERTREND_FLIP
+        return None
+
+    # ------------------------------------------------------------------
+    # Signal evaluation
+    # ------------------------------------------------------------------
+    def __init__(self) -> None:
+        self._refresh_config()
+
+    def _refresh_config(self) -> None:
+        """Read signal-gate parameters from config. Called at init and can be
+        called again after a hot-reload to pick up new RSI/volume thresholds."""
+        cfg = config.get("scalping", {})
+        rsi = cfg.get("rsi", {})
+        vol = cfg.get("volume", {})
+
+        self.rsi_overbought    = float(rsi.get("overbought", 80))
+        self.rsi_oversold      = float(rsi.get("oversold", 20))
+        self.rsi_long_min      = float(rsi.get("long_min", 50))
+        self.rsi_short_max     = float(rsi.get("short_max", 50))
+        self.vol_threshold_bn  = int(vol.get("banknifty_threshold", 0))
+        self.vol_threshold_nifty = int(vol.get("nifty_threshold", 0))
 
     def _volume_threshold(self, underlying: str) -> int:
         if "NIFTY" in underlying.upper() and "BANK" not in underlying.upper():
@@ -52,13 +118,12 @@ class TwoCandleStrategy:
 
     def evaluate(self, df: pd.DataFrame, underlying: str = "BANKNIFTY") -> Optional[Signal]:
         """Evaluate the last 2 candles. Returns a Signal if conditions met, else None.
-        Requires df with indicator columns (see technical.compute_all_indicators).
+        Requires df with indicator columns (see compute_indicators above).
         """
         if len(df) < 3:
             return None
 
-        # We use the last two COMPLETED candles. The very last row may be the current forming candle.
-        # Convention: df[-1] is the most recent COMPLETED candle.
+        # We use the last two COMPLETED candles.
         c1 = df.iloc[-2]  # first of the two
         c2 = df.iloc[-1]  # second (more recent)
 
@@ -66,24 +131,24 @@ class TwoCandleStrategy:
 
         # ---------- LONG evaluation ----------
         long_conditions = {
-            "two_green": c1["close"] > c1["open"] and c2["close"] > c2["open"],
-            "volume_ok": c1["volume"] >= vol_threshold and c2["volume"] >= vol_threshold,
-            "rsi_range": self.rsi_long_min <= c2["rsi"] < self.rsi_overbought,
-            "above_vwap": c2["close"] > c2["vwap"],
+            "two_green":      c1["close"] > c1["open"] and c2["close"] > c2["open"],
+            "volume_ok":      c1["volume"] >= vol_threshold and c2["volume"] >= vol_threshold,
+            "rsi_range":      self.rsi_long_min <= c2["rsi"] < self.rsi_overbought,
+            "above_vwap":     c2["close"] > c2["vwap"],
             "supertrend_buy": c2["supertrend_dir"] == 1,
-            "psar_below": c2["psar_dir"] == 1,
+            "psar_below":     c2["psar_dir"] == 1,
         }
 
         long_met = sum(long_conditions.values())
 
         # ---------- SHORT evaluation ----------
         short_conditions = {
-            "two_red": c1["close"] < c1["open"] and c2["close"] < c2["open"],
-            "volume_ok": c1["volume"] >= vol_threshold and c2["volume"] >= vol_threshold,
-            "rsi_range": self.rsi_oversold < c2["rsi"] <= self.rsi_short_max,
-            "below_vwap": c2["close"] < c2["vwap"],
+            "two_red":         c1["close"] < c1["open"] and c2["close"] < c2["open"],
+            "volume_ok":       c1["volume"] >= vol_threshold and c2["volume"] >= vol_threshold,
+            "rsi_range":       self.rsi_oversold < c2["rsi"] <= self.rsi_short_max,
+            "below_vwap":      c2["close"] < c2["vwap"],
             "supertrend_sell": c2["supertrend_dir"] == -1,
-            "psar_above": c2["psar_dir"] == -1,
+            "psar_above":      c2["psar_dir"] == -1,
         }
 
         short_met = sum(short_conditions.values())
@@ -92,13 +157,9 @@ class TwoCandleStrategy:
 
         # Directional exclusivity: pick whichever direction has more conditions met
         if long_met >= 5 and long_met > short_met:
-            signal = self._build_signal(
-                c2, underlying, TradeType.LONG, long_conditions, long_met
-            )
+            signal = self._build_signal(c2, underlying, TradeType.LONG, long_conditions, long_met)
         elif short_met >= 5 and short_met > long_met:
-            signal = self._build_signal(
-                c2, underlying, TradeType.SHORT, short_conditions, short_met
-            )
+            signal = self._build_signal(c2, underlying, TradeType.SHORT, short_conditions, short_met)
 
         return signal
 
@@ -110,7 +171,6 @@ class TwoCandleStrategy:
         conditions: dict[str, bool],
         count: int,
     ) -> Signal:
-        # Strength grading
         vol_ratio = float(candle.get("volume_ratio", 1.0))
         if count == 6 and vol_ratio >= 1.5:
             strength = SignalStrength.STRONG
@@ -122,17 +182,17 @@ class TwoCandleStrategy:
             strength = SignalStrength.WEAK
 
         reasons = [k for k, v in conditions.items() if v]
-        failed = [k for k, v in conditions.items() if not v]
+        failed  = [k for k, v in conditions.items() if not v]
 
         sig = Signal(
-            timestamp=candle.name if isinstance(candle.name, datetime) else datetime.now(),
-            trade_type=trade_type,
-            strength=strength,
-            underlying=underlying,
-            underlying_price=float(candle["close"]),
-            reasons=reasons,
-            conditions_met=count,
-            volume_ratio=vol_ratio,
+            timestamp       = candle.name if isinstance(candle.name, datetime) else datetime.now(),
+            trade_type      = trade_type,
+            strength        = strength,
+            underlying      = underlying,
+            underlying_price= float(candle["close"]),
+            reasons         = reasons,
+            conditions_met  = count,
+            volume_ratio    = vol_ratio,
         )
 
         log.info(
@@ -143,7 +203,9 @@ class TwoCandleStrategy:
 
 
 class PositionalTrendFilter:
-    """Checks the 15-min SuperTrend for re-entry confirmation."""
+    """Checks the 15-min SuperTrend for re-entry confirmation.
+    Shared across all strategies — not strategy-specific.
+    """
 
     def trend_agrees(self, df_15min: pd.DataFrame, trade_type: TradeType) -> bool:
         """Returns True if the 15-min SuperTrend direction agrees with the intended trade."""
@@ -151,10 +213,10 @@ class PositionalTrendFilter:
             log.warning("No 15-min data for trend filter; allowing trade.")
             return True
 
-        last = df_15min.iloc[-1]
+        last   = df_15min.iloc[-1]
         st_dir = last.get("supertrend_dir", 0)
 
-        if trade_type == TradeType.LONG and st_dir == 1:
+        if trade_type == TradeType.LONG  and st_dir == 1:
             return True
         if trade_type == TradeType.SHORT and st_dir == -1:
             return True
