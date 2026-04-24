@@ -159,12 +159,18 @@ trade_rules:
   # consecutive losing trades (SL/flip exits in a row). Resets on a winning trade.
   max_consecutive_losses: 2
   consecutive_loss_pause_candles: 6
+  # No-trade windows: block ALL entries during specified time ranges (HH:MM IST).
+  # Lunch hour (11:00-13:00) is institutionally dead — choppy, low conviction.
+  # Add more windows as a list of {start, end} pairs if needed.
+  no_trade_windows:
+    - { start: "11:00", end: "13:00" }   # Lunch dead zone
 
 stop_loss:
   trailing:
     enabled: true
     points_trail_step: 5        # move SL by 5 pts for every 5 pts gain
-    activation_profit_pts: 10   # start trailing after 10 pts profit
+    activation_profit_pts: 10   # start trailing after 10 pts profit (MEDIUM signals)
+    strong_activation_profit_pts: 15  # wider activation for STRONG signals (3 lots — needs more room)
     exit_on_supertrend_flip: true  # scalping: SuperTrend flip | ichimoku: TK cross / cloud re-entry
 
   # Target profit: 30 pts gives 1.5:1 R:R against a 20-pt SL.

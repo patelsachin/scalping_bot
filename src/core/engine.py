@@ -696,10 +696,14 @@ class TradingEngine:
         # F32 — Hot-reload settings.yaml so SL/target tweaks take effect without restart
         try:
             config.reload()
-            self.risk.target_points    = float(config.get("stop_loss.target_points", 10))
-            self.risk.max_risk_points  = float(config.get("stop_loss.max_risk_points", 20))
-            self.risk.trail_step       = float(config.get("stop_loss.trailing.points_trail_step", 5))
-            self.risk.trail_activation = float(config.get("stop_loss.trailing.activation_profit_pts", 5))
+            self.risk.target_points         = float(config.get("stop_loss.target_points", 10))
+            self.risk.max_risk_points       = float(config.get("stop_loss.max_risk_points", 20))
+            self.risk.trail_step            = float(config.get("stop_loss.trailing.points_trail_step", 5))
+            self.risk.trail_activation      = float(config.get("stop_loss.trailing.activation_profit_pts", 10))
+            self.risk.trail_activation_strong = float(
+                config.get("stop_loss.trailing.strong_activation_profit_pts",
+                           config.get("stop_loss.trailing.activation_profit_pts", 10))
+            )
         except Exception as _e:
             log.debug(f"Config hot-reload skipped: {_e}")
 
@@ -803,6 +807,26 @@ class TradingEngine:
                     f"{candle_ts_raw.strftime('%H:%M')} (no entries before {no_entry_before_str} IST)"
                 )
                 return
+        except Exception:
+            pass  # malformed config — allow entry rather than blocking
+
+        # --- No-trade window filter: block entries during configured time ranges ---
+        # Handles lunch hour (11:00-13:00) and any other dead zones in settings.yaml.
+        # Applies to ALL strategies. Uses candle_ts_raw already resolved above.
+        try:
+            no_trade_windows = config.get("trade_rules.no_trade_windows", [])
+            for _window in no_trade_windows:
+                _ws_hh, _ws_mm = str(_window.get("start", "00:00")).split(":")
+                _we_hh, _we_mm = str(_window.get("end",   "00:00")).split(":")
+                _win_start = int(_ws_hh) * 60 + int(_ws_mm)
+                _win_end   = int(_we_hh) * 60 + int(_we_mm)
+                if _win_start <= candle_hhmm < _win_end:
+                    log.debug(
+                        f"No-trade window: skipping entry at "
+                        f"{candle_ts_raw.strftime('%H:%M')} "
+                        f"(blocked {_window.get('start')}–{_window.get('end')} IST)"
+                    )
+                    return
         except Exception:
             pass  # malformed config — allow entry rather than blocking
 

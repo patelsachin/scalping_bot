@@ -128,13 +128,27 @@ class TwoCandleStrategy(StrategyBase):
         c2 = df.iloc[-1]  # second (more recent)
 
         vol_threshold = self._volume_threshold(underlying)
+        close2  = float(c2["close"])
+        vwap2   = float(c2.get("vwap", close2))
+
+        # --- VWAP hard directional gate ---
+        # Trading a CE (LONG) while price is below VWAP means we're fighting the
+        # intraday trend. Trading a PE (SHORT) while price is above VWAP is the
+        # same mistake. Block both unconditionally — do not just score them.
+        long_vwap_ok  = close2 > vwap2
+        short_vwap_ok = close2 < vwap2
+
+        if not long_vwap_ok and not short_vwap_ok:
+            # Price exactly at VWAP — ambiguous, skip
+            log.debug(f"VWAP gate: price {close2:.2f} == VWAP {vwap2:.2f} — no trade")
+            return None
 
         # ---------- LONG evaluation ----------
         long_conditions = {
             "two_green":      c1["close"] > c1["open"] and c2["close"] > c2["open"],
             "volume_ok":      c1["volume"] >= vol_threshold and c2["volume"] >= vol_threshold,
             "rsi_range":      self.rsi_long_min <= c2["rsi"] < self.rsi_overbought,
-            "above_vwap":     c2["close"] > c2["vwap"],
+            "above_vwap":     long_vwap_ok,
             "supertrend_buy": c2["supertrend_dir"] == 1,
             "psar_below":     c2["psar_dir"] == 1,
         }
@@ -146,12 +160,18 @@ class TwoCandleStrategy(StrategyBase):
             "two_red":         c1["close"] < c1["open"] and c2["close"] < c2["open"],
             "volume_ok":       c1["volume"] >= vol_threshold and c2["volume"] >= vol_threshold,
             "rsi_range":       self.rsi_oversold < c2["rsi"] <= self.rsi_short_max,
-            "below_vwap":      c2["close"] < c2["vwap"],
+            "below_vwap":      short_vwap_ok,
             "supertrend_sell": c2["supertrend_dir"] == -1,
             "psar_above":      c2["psar_dir"] == -1,
         }
 
         short_met = sum(short_conditions.values())
+
+        # Hard VWAP gate: block the wrong direction entirely regardless of score
+        if not long_vwap_ok:
+            long_met = 0   # LONG blocked — price below VWAP
+        if not short_vwap_ok:
+            short_met = 0  # SHORT blocked — price above VWAP
 
         signal: Optional[Signal] = None
 

@@ -39,7 +39,11 @@ class RiskManager:
         trail_cfg = config.get("stop_loss.trailing", {})
         self.trail_enabled = trail_cfg.get("enabled", True)
         self.trail_step = float(trail_cfg.get("points_trail_step", 5))
-        self.trail_activation = float(trail_cfg.get("activation_profit_pts", 5))
+        self.trail_activation = float(trail_cfg.get("activation_profit_pts", 10))
+        self.trail_activation_strong = float(
+            trail_cfg.get("strong_activation_profit_pts",
+                          trail_cfg.get("activation_profit_pts", 10))
+        )
         self.exit_on_supertrend_flip = trail_cfg.get("exit_on_supertrend_flip", True)
 
     # ------------------------------------------------------------
@@ -133,6 +137,10 @@ class RiskManager:
     def compute_trailing_sl(self, trade: Trade, current_price: float) -> float:
         """Trail SL upward (for long) / downward (for short) in `trail_step` increments
         once in profit by `trail_activation` points.
+
+        STRONG signals get a wider activation threshold (strong_activation_profit_pts)
+        so 3-lot positions have more room to breathe before the trail kicks in.
+
         Returns the new SL (never worse than current).
         """
         if not self.trail_enabled:
@@ -140,19 +148,26 @@ class RiskManager:
 
         current_sl = trade.trailing_sl if trade.trailing_sl else trade.stop_loss
 
+        # Pick activation threshold based on signal strength
+        activation = (
+            self.trail_activation_strong
+            if trade.signal_strength == SignalStrength.STRONG
+            else self.trail_activation
+        )
+
         if trade.trade_type == TradeType.LONG:
             profit_pts = current_price - trade.entry_price
-            if profit_pts < self.trail_activation:
+            if profit_pts < activation:
                 return current_sl
             # How many `trail_step` increments above the activation point?
-            steps = int((profit_pts - self.trail_activation) // self.trail_step) + 1
+            steps = int((profit_pts - activation) // self.trail_step) + 1
             new_sl = trade.entry_price + (steps - 1) * self.trail_step
             return round(max(new_sl, current_sl), 2)
         else:
             profit_pts = trade.entry_price - current_price
-            if profit_pts < self.trail_activation:
+            if profit_pts < activation:
                 return current_sl
-            steps = int((profit_pts - self.trail_activation) // self.trail_step) + 1
+            steps = int((profit_pts - activation) // self.trail_step) + 1
             new_sl = trade.entry_price - (steps - 1) * self.trail_step
             return round(min(new_sl, current_sl), 2)
 
