@@ -23,7 +23,7 @@ mode:
 #   ichimoku  → Ichimoku Kinko Hyo (cloud, TK cross, Kijun magnet) — 1-min chart
 # ----------------------------------------------------------
 strategy:
-  type: scalping   # scalping | ichimoku
+  type: ichimoku   # scalping | ichimoku
 
 capital:
   # Maximum capital allocated for the day (INR)

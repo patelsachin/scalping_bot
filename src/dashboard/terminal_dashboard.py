@@ -42,6 +42,8 @@ def _header_panel(snap: dict) -> Panel:
     status_line.append("  |  ", style="dim")
     status_line.append(f"BANKNIFTY: ₹{snap['underlying_ltp']:,.2f}", style="cyan")
     status_line.append(f"  |  ATM: {int(snap['atm_strike'])}", style="cyan")
+    status_line.append(f"  |  Strategy:", style="dim")
+    status_line.append(f"  {config.get('strategy.type', 'scalping').upper()}", style="white")
 
     vix = snap.get("vix", 0.0)
     regime = snap.get("market_regime", "UNKNOWN")
