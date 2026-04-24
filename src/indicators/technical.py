@@ -272,12 +272,20 @@ def compute_ichimoku_indicators(
     displacement: int = 26,
     volume_avg_period: int = 20,
 ) -> pd.DataFrame:
-    """Add Ichimoku + volume columns to df. Entry point for IchimokuStrategy."""
+    """Add Ichimoku + volume columns to df. Entry point for IchimokuStrategy.
+
+    Uses column-by-column assignment (not pd.concat) so that re-running on a
+    dataframe that already has Ichimoku columns simply overwrites them cleanly.
+    pd.concat(axis=1) on a df with existing indicator columns creates duplicate
+    column names, which breaks the subsequent row-append in _on_candle_close.
+    """
     if df.empty:
         return df
     out = df.copy()
     ichi = ichimoku(out, tenkan_period, kijun_period, senkou_b_period, displacement)
-    out = pd.concat([out, ichi], axis=1)
+    # Assign each column individually — overwrites existing columns, never duplicates
+    for col in ichi.columns:
+        out[col] = ichi[col]
     out["volume_avg"]   = volume_avg(out["volume"], volume_avg_period)
     out["volume_ratio"] = out["volume"] / out["volume_avg"].replace(0, np.nan)
     out["volume_ratio"] = out["volume_ratio"].fillna(1.0)
