@@ -76,18 +76,18 @@ class TwoCandleStrategy(StrategyBase):
         )
 
     def exit_signal(self, trade: Trade, df: pd.DataFrame) -> Optional[ExitReason]:
-        """Exit when SuperTrend flips against the open trade direction."""
+        """Exit when SuperTrend flips against the open option position."""
         if not config.get("stop_loss.trailing.exit_on_supertrend_flip", True):
             return None
         if df.empty:
             return None
 
         st_dir = int(df.iloc[-1].get("supertrend_dir", 0))
-        if trade.trade_type == TradeType.LONG and st_dir == -1:
-            log.info(f"SuperTrend flip exit triggered for {trade.trade_id} (LONG → bearish)")
+        if trade.option_type == "CE" and st_dir == -1:
+            log.info(f"SuperTrend flip exit triggered for {trade.trade_id} (CE/bullish → bearish flip)")
             return ExitReason.SUPERTREND_FLIP
-        if trade.trade_type == TradeType.SHORT and st_dir == 1:
-            log.info(f"SuperTrend flip exit triggered for {trade.trade_id} (SHORT → bullish)")
+        if trade.option_type == "PE" and st_dir == 1:
+            log.info(f"SuperTrend flip exit triggered for {trade.trade_id} (PE/bearish → bullish flip)")
             return ExitReason.SUPERTREND_FLIP
         return None
 
@@ -205,14 +205,15 @@ class TwoCandleStrategy(StrategyBase):
         failed  = [k for k, v in conditions.items() if not v]
 
         sig = Signal(
-            timestamp       = candle.name if isinstance(candle.name, datetime) else datetime.now(),
-            trade_type      = trade_type,
-            strength        = strength,
-            underlying      = underlying,
-            underlying_price= float(candle["close"]),
-            reasons         = reasons,
-            conditions_met  = count,
-            volume_ratio    = vol_ratio,
+            timestamp        = candle.name if isinstance(candle.name, datetime) else datetime.now(),
+            trade_type       = TradeType.LONG,   # always LONG — system only buys options
+            option_type      = "CE" if trade_type == TradeType.LONG else "PE",
+            strength         = strength,
+            underlying       = underlying,
+            underlying_price = float(candle["close"]),
+            reasons          = reasons,
+            conditions_met   = count,
+            volume_ratio     = vol_ratio,
         )
 
         log.info(
@@ -227,8 +228,11 @@ class PositionalTrendFilter:
     Shared across all strategies — not strategy-specific.
     """
 
-    def trend_agrees(self, df_15min: pd.DataFrame, trade_type: TradeType) -> bool:
-        """Returns True if the 15-min SuperTrend direction agrees with the intended trade."""
+    def trend_agrees(self, df_15min: pd.DataFrame, option_type: str) -> bool:
+        """Returns True if the 15-min SuperTrend direction agrees with the option type.
+        CE (bullish view): requires uptrend (st_dir == 1)
+        PE (bearish view): requires downtrend (st_dir == -1)
+        """
         if df_15min is None or df_15min.empty:
             log.warning("No 15-min data for trend filter; allowing trade.")
             return True
@@ -236,8 +240,8 @@ class PositionalTrendFilter:
         last   = df_15min.iloc[-1]
         st_dir = last.get("supertrend_dir", 0)
 
-        if trade_type == TradeType.LONG  and st_dir == 1:
+        if option_type == "CE" and st_dir == 1:
             return True
-        if trade_type == TradeType.SHORT and st_dir == -1:
+        if option_type == "PE" and st_dir == -1:
             return True
         return False

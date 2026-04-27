@@ -113,36 +113,46 @@ class IchimokuStrategy(StrategyBase):
 
         vol_ok = vol_ratio >= min_vol_ratio
 
-        # ---------- LONG conditions ----------
-        long_conditions: dict[str, bool] = {
+        # --- Kijun hard gate (applied before scoring) ---
+        # A rising Kijun blocks bearish PE entries; a falling Kijun blocks bullish CE entries.
+        # Kijun direction is the "slow magnet" confirmation — without it, the signal fights
+        # the equilibrium level and reverts. This is not a scored condition, it's a hard block.
+        kijun_rising  = (not kijun_is_flat) and (kijun_slope > 0)
+        kijun_falling = (not kijun_is_flat) and (kijun_slope < 0)
+
+        # ---------- CE (bullish) conditions ----------
+        ce_conditions: dict[str, bool] = {
             "above_cloud":   price_vs_cloud == 1,
             "cloud_green":   cloud_color == 1,
             "tk_bullish":    tenkan > kijun,
-            "kijun_rising":  (not kijun_is_flat) and (kijun_slope > 0)
-                             if require_kijun_slope else True,
             "outside_cloud": price_vs_cloud != 0 if require_outside_cloud else True,
             "volume_ok":     vol_ok,
         }
 
-        # ---------- SHORT conditions ----------
-        short_conditions: dict[str, bool] = {
+        # ---------- PE (bearish) conditions ----------
+        pe_conditions: dict[str, bool] = {
             "below_cloud":   price_vs_cloud == -1,
             "cloud_red":     cloud_color == -1,
             "tk_bearish":    tenkan < kijun,
-            "kijun_falling": (not kijun_is_flat) and (kijun_slope < 0)
-                             if require_kijun_slope else True,
             "outside_cloud": price_vs_cloud != 0 if require_outside_cloud else True,
             "volume_ok":     vol_ok,
         }
 
-        long_met  = sum(long_conditions.values())
-        short_met = sum(short_conditions.values())
+        ce_met = sum(ce_conditions.values())
+        pe_met = sum(pe_conditions.values())
+
+        # Hard gate: Kijun must confirm direction — block signal entirely if not
+        if require_kijun_slope and not kijun_rising:
+            ce_met = 0
+        if require_kijun_slope and not kijun_falling:
+            pe_met = 0
 
         signal: Optional[Signal] = None
-        if long_met >= 5 and long_met > short_met:
-            signal = self._build_signal(c2, underlying, TradeType.LONG, long_conditions, long_met)
-        elif short_met >= 5 and short_met > long_met:
-            signal = self._build_signal(c2, underlying, TradeType.SHORT, short_conditions, short_met)
+        # Need all 5 scored conditions to fire; directional exclusivity preserved
+        if ce_met >= 5 and ce_met > pe_met:
+            signal = self._build_signal(c2, underlying, "CE", ce_conditions, ce_met)
+        elif pe_met >= 5 and pe_met > ce_met:
+            signal = self._build_signal(c2, underlying, "PE", pe_conditions, pe_met)
 
         return signal
 
@@ -150,18 +160,19 @@ class IchimokuStrategy(StrategyBase):
         self,
         candle: pd.Series,
         underlying: str,
-        trade_type: TradeType,
+        option_type: str,   # "CE" (bullish) or "PE" (bearish)
         conditions: dict[str, bool],
         count: int,
     ) -> Signal:
-        strength = SignalStrength.STRONG if count == 6 else SignalStrength.MEDIUM
-        reasons  = [k for k, v in conditions.items() if     v]
-        failed   = [k for k, v in conditions.items() if not v]
+        strength  = SignalStrength.STRONG if count == 5 else SignalStrength.MEDIUM
+        reasons   = [k for k, v in conditions.items() if     v]
+        failed    = [k for k, v in conditions.items() if not v]
         vol_ratio = float(candle.get("volume_ratio", 1.0))
 
         sig = Signal(
             timestamp        = candle.name if isinstance(candle.name, datetime) else datetime.now(),
-            trade_type       = trade_type,
+            trade_type       = TradeType.LONG,   # always LONG — system only buys options
+            option_type      = option_type,
             strength         = strength,
             underlying       = underlying,
             underlying_price = float(candle["close"]),
@@ -170,8 +181,8 @@ class IchimokuStrategy(StrategyBase):
             volume_ratio     = vol_ratio,
         )
         log.info(
-            f"ICHIMOKU SIGNAL {trade_type.value} [{strength.value}] {underlying} "
-            f"@ {sig.underlying_price:.2f} | {count}/6 conditions | failed={failed} | "
+            f"ICHIMOKU SIGNAL {option_type} [{strength.value}] {underlying} "
+            f"@ {sig.underlying_price:.2f} | {count}/5 conditions | failed={failed} | "
             f"vol_ratio={vol_ratio:.2f}"
         )
         return sig
@@ -201,7 +212,7 @@ class IchimokuStrategy(StrategyBase):
 
         price_vs_cloud_curr = int(c_curr.get("price_vs_cloud", 0))
 
-        if trade.trade_type == TradeType.LONG:
+        if trade.option_type == "CE":
             tk_bearish_cross = (tenkan_prev >= kijun_prev) and (tenkan_curr < kijun_curr)
             cloud_adverse    = price_vs_cloud_curr <= 0  # entered cloud or fell below
             if tk_bearish_cross or cloud_adverse:
@@ -211,9 +222,9 @@ class IchimokuStrategy(StrategyBase):
                     f"(tenkan={tenkan_curr:.2f}, kijun={kijun_curr:.2f}, "
                     f"price_vs_cloud={price_vs_cloud_curr})"
                 )
-                return ExitReason.SUPERTREND_FLIP  # reuses existing enum value
+                return ExitReason.SUPERTREND_FLIP
 
-        elif trade.trade_type == TradeType.SHORT:
+        elif trade.option_type == "PE":
             tk_bullish_cross = (tenkan_prev <= kijun_prev) and (tenkan_curr > kijun_curr)
             cloud_adverse    = price_vs_cloud_curr >= 0  # entered cloud or rose above
             if tk_bullish_cross or cloud_adverse:

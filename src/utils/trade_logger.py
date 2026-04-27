@@ -27,7 +27,8 @@ class TradeLogger:
         "trade_id",
         "symbol",
         "underlying",
-        "trade_type",
+        "trade_type",        # always LONG — system only buys options
+        "option_type",       # CE (bullish view) or PE (bearish view)
         "signal_strength",
         "strategy",          # ← which strategy generated this trade
         "entry_time",

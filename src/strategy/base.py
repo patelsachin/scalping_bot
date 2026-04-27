@@ -38,8 +38,11 @@ class StrategyBase(ABC):
     @property
     def timeframe_str(self) -> str:
         """Kite-compatible interval string derived from timeframe_minutes.
-        e.g. 1 → '1minute', 3 → '3minute', 15 → '15minute'
+        Kite uses "minute" (not "1minute") for the 1-min interval.
+        e.g. 1 → 'minute', 3 → '3minute', 15 → '15minute'
         """
+        if self.timeframe_minutes == 1:
+            return "minute"
         return f"{self.timeframe_minutes}minute"
 
     @property

@@ -43,12 +43,13 @@ class SignalStrength(str, Enum):
 class Signal:
     """A trading signal emitted by the strategy engine."""
     timestamp: datetime
-    trade_type: TradeType
+    option_type: str           # "CE" (bullish view) or "PE" (bearish view)
     strength: SignalStrength
-    underlying: str           # e.g. "BANKNIFTY"
-    underlying_price: float   # spot / future price at signal time
+    underlying: str            # e.g. "BANKNIFTY"
+    underlying_price: float    # spot / future price at signal time
+    trade_type: TradeType = TradeType.LONG  # always LONG — system only buys options
     reasons: list[str] = field(default_factory=list)
-    conditions_met: int = 0   # count out of 6
+    conditions_met: int = 0    # count out of 6
     volume_ratio: float = 1.0  # current vol / avg vol
 
 
@@ -58,7 +59,8 @@ class Trade:
     trade_id: str = field(default_factory=lambda: str(uuid4())[:8])
     symbol: str = ""                 # e.g. "BANKNIFTY25JAN52000CE"
     underlying: str = ""             # "BANKNIFTY"
-    trade_type: TradeType = TradeType.LONG
+    trade_type: TradeType = TradeType.LONG   # always LONG — system only buys options
+    option_type: str = "CE"          # "CE" (bullish) or "PE" (bearish)
     signal_strength: SignalStrength = SignalStrength.MEDIUM
 
     # Entry
@@ -109,13 +111,11 @@ class Trade:
         return self.status == TradeStatus.CLOSED
 
     def update_pnl(self, current_price: float) -> float:
-        """Compute unrealised P&L at the given price."""
-        if self.trade_type == TradeType.LONG:
-            points = current_price - self.entry_price
-        else:
-            points = self.entry_price - current_price
-        self.pnl_points = points
-        self.pnl = points * self.quantity
+        """Compute unrealised P&L at the given price.
+        Always LONG option logic: profit when premium rises, loss when it drops.
+        """
+        self.pnl_points = current_price - self.entry_price
+        self.pnl = self.pnl_points * self.quantity
         return self.pnl
 
     def finalise_pnl(self) -> None:
@@ -132,6 +132,7 @@ class Trade:
             "symbol": self.symbol,
             "underlying": self.underlying,
             "trade_type": self.trade_type.value,
+            "option_type": self.option_type,
             "signal_strength": self.signal_strength.value,
             "entry_time": self.entry_time.isoformat() if self.entry_time else "",
             "entry_price": round(self.entry_price, 2),

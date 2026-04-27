@@ -228,7 +228,7 @@ class TradingEngine:
             log.error("ATM strike lookup failed.")
             return "", 0.0
 
-        option_type = "CE" if signal.trade_type == TradeType.LONG else "PE"
+        option_type = signal.option_type   # "CE" (bullish) or "PE" (bearish)
         symbol = self.broker.get_option_symbol(self.underlying, expiry, atm, option_type)
         if not symbol:
             log.error(f"Failed to resolve option symbol for {atm} {option_type}")
@@ -286,9 +286,10 @@ class TradingEngine:
         trade = Trade(
             symbol=symbol,
             underlying=self.underlying,
-            trade_type=signal.trade_type,
+            trade_type=TradeType.LONG,             # always LONG — system only buys options
+            option_type=signal.option_type,        # "CE" (bullish) or "PE" (bearish)
             signal_strength=signal.strength,
-            strategy=self.strategy.name,          # records which strategy fired this trade
+            strategy=self.strategy.name,           # records which strategy fired this trade
             entry_time=now_ist(),
             entry_price=premium,
             quantity=qty,
@@ -845,9 +846,9 @@ class TradingEngine:
         if self._cooldown_until and now_ist() >= self._cooldown_until:
             positional_df = self.prepare_positional_candles()
             if positional_df is not None:
-                if not self.trend_filter.trend_agrees(positional_df, signal.trade_type):
+                if not self.trend_filter.trend_agrees(positional_df, signal.option_type):
                     log.info(
-                        f"Re-entry blocked: 15-min trend disagrees with {signal.trade_type.value}"
+                        f"Re-entry blocked: 15-min trend disagrees with {signal.option_type}"
                     )
                     return
             self._cooldown_until = None
