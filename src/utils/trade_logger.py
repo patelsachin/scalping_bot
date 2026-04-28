@@ -31,6 +31,7 @@ class TradeLogger:
         "option_type",       # CE (bullish view) or PE (bearish view)
         "signal_strength",
         "strategy",          # ← which strategy generated this trade
+        "market",            # ← which market: india | us
         "entry_time",
         "entry_price",
         "quantity",

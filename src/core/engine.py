@@ -282,6 +282,7 @@ class TradingEngine:
             option_type=signal.option_type,        # "CE" (bullish) or "PE" (bearish)
             signal_strength=signal.strength,
             strategy=self.strategy.name,           # records which strategy fired this trade
+            market=config.active_market(),         # "india" | "us"
             entry_time=now_ist(),
             entry_price=premium,
             quantity=qty,

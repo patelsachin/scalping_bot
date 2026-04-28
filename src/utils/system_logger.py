@@ -37,7 +37,7 @@ EVENT_CONFIG_RELOAD = "CONFIG_RELOAD"
 class SystemLogger:
     """Appends system events to logs/system.csv. Thread-safe."""
 
-    HEADERS = ["timestamp", "event_type", "detail", "vix", "market_regime", "mode"]
+    HEADERS = ["timestamp", "event_type", "detail", "market", "vix", "market_regime", "mode"]
 
     def __init__(self) -> None:
         log_path = config.project_root / config.get(
@@ -63,10 +63,17 @@ class SystemLogger:
         except Exception:
             vix = regime = mode = ""
 
+        try:
+            from src.utils.config_loader import config as _cfg
+            active_market = _cfg.active_market()
+        except Exception:
+            active_market = ""
+
         row = {
             "timestamp":    datetime.now().isoformat(timespec="seconds"),
             "event_type":   event_type,
             "detail":       detail,
+            "market":       active_market,
             "vix":          vix,
             "market_regime": regime,
             "mode":         mode,

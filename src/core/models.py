@@ -100,6 +100,9 @@ class Trade:
     # Populated by the engine from self.strategy.name at entry time.
     strategy: str = "scalping"
 
+    # Market this trade belongs to — "india" | "us"
+    market: str = "india"
+
     # Underlying price at entry (for context)
     underlying_entry_price: float = 0.0
     underlying_exit_price: float = 0.0
@@ -151,6 +154,7 @@ class Trade:
             "status": self.status.value,
             "is_paper": self.is_paper,
             "strategy": self.strategy,
+            "market": self.market,
         }
 
 
