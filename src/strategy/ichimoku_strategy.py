@@ -191,13 +191,12 @@ class IchimokuStrategy(StrategyBase):
     # Candle-close exit (Discussion C)
     # ------------------------------------------------------------------
     def exit_signal(self, trade: Trade, df: pd.DataFrame) -> Optional[ExitReason]:
-        """Exit when Tenkan crosses Kijun against trade direction, or price enters the cloud.
+        """Exit when Tenkan crosses Kijun against trade direction (TK cross only).
 
-        Two conditions checked:
-        1. TK cross: Tenkan was on the favourable side of Kijun last candle,
-           now it has crossed to the unfavourable side.
-        2. Cloud re-entry: price was outside the cloud (price_vs_cloud ≠ 0)
-           and has now moved inside (price_vs_cloud = 0) or past it.
+        Cloud re-entry is NOT used as an exit trigger — on a 1-min chart, BankNifty
+        regularly bounces into the cloud during a valid trend move, and cloud exits
+        cause premature ejection before the real move unfolds. TK cross is the
+        reliable signal that momentum has genuinely shifted.
         """
         if len(df) < 2:
             return None
@@ -210,29 +209,19 @@ class IchimokuStrategy(StrategyBase):
         tenkan_curr = float(c_curr.get("tenkan", 0))
         kijun_curr  = float(c_curr.get("kijun",  0))
 
-        price_vs_cloud_curr = int(c_curr.get("price_vs_cloud", 0))
-
         if trade.option_type == "CE":
-            tk_bearish_cross = (tenkan_prev >= kijun_prev) and (tenkan_curr < kijun_curr)
-            cloud_adverse    = price_vs_cloud_curr <= 0  # entered cloud or fell below
-            if tk_bearish_cross or cloud_adverse:
-                reason_str = "TK bearish cross" if tk_bearish_cross else "price entered/below cloud"
+            if (tenkan_prev >= kijun_prev) and (tenkan_curr < kijun_curr):
                 log.info(
-                    f"Ichimoku exit [{reason_str}] for {trade.trade_id} "
-                    f"(tenkan={tenkan_curr:.2f}, kijun={kijun_curr:.2f}, "
-                    f"price_vs_cloud={price_vs_cloud_curr})"
+                    f"Ichimoku exit [TK bearish cross] for {trade.trade_id} "
+                    f"(tenkan={tenkan_curr:.2f}, kijun={kijun_curr:.2f})"
                 )
                 return ExitReason.SUPERTREND_FLIP
 
         elif trade.option_type == "PE":
-            tk_bullish_cross = (tenkan_prev <= kijun_prev) and (tenkan_curr > kijun_curr)
-            cloud_adverse    = price_vs_cloud_curr >= 0  # entered cloud or rose above
-            if tk_bullish_cross or cloud_adverse:
-                reason_str = "TK bullish cross" if tk_bullish_cross else "price entered/above cloud"
+            if (tenkan_prev <= kijun_prev) and (tenkan_curr > kijun_curr):
                 log.info(
-                    f"Ichimoku exit [{reason_str}] for {trade.trade_id} "
-                    f"(tenkan={tenkan_curr:.2f}, kijun={kijun_curr:.2f}, "
-                    f"price_vs_cloud={price_vs_cloud_curr})"
+                    f"Ichimoku exit [TK bullish cross] for {trade.trade_id} "
+                    f"(tenkan={tenkan_curr:.2f}, kijun={kijun_curr:.2f})"
                 )
                 return ExitReason.SUPERTREND_FLIP
 

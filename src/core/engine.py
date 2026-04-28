@@ -853,6 +853,15 @@ class TradingEngine:
                     return
             self._cooldown_until = None
 
+        # --- Max open positions gate ---
+        max_pos = int(config.get("trade_rules.max_open_positions", 0))
+        if max_pos > 0 and len(state.open_trades) >= max_pos:
+            log.debug(
+                f"Max open positions ({max_pos}) reached — skipping entry "
+                f"(open={len(state.open_trades)})"
+            )
+            return
+
         self.enter_trade(signal, df_snapshot)
 
         # Refresh ATM for dashboard
