@@ -97,6 +97,11 @@ scalping:
     banknifty_threshold: 0
     nifty_threshold: 0
 
+  # Scalping dead zones: lunch hour is choppy for 3-min SuperTrend signals.
+  # Validated Apr 24: 4 trades, 3 losers, -Rs 1,424 during 11:00-13:00.
+  no_trade_windows:
+    - { start: "11:00", end: "13:00" }   # Lunch dead zone for scalping
+
 # ----------------------------------------------------------
 # Ichimoku strategy parameters  (used when strategy.type = ichimoku)
 # ----------------------------------------------------------
@@ -127,6 +132,11 @@ ichimoku:
   volume:
     banknifty_threshold: 0   # absolute threshold (0 = use min_volume_ratio instead)
     nifty_threshold: 0
+
+  # Ichimoku follows trends — strong moves often run through lunch (validated Apr 28:
+  # the best PE move was 11:00-12:10, exactly the window scalping blocks).
+  # No no-trade windows for Ichimoku.
+  no_trade_windows: []
 
 # ----------------------------------------------------------
 # Positional trend filter — shared across ALL strategies
@@ -159,11 +169,10 @@ trade_rules:
   # consecutive losing trades (SL/flip exits in a row). Resets on a winning trade.
   max_consecutive_losses: 2
   consecutive_loss_pause_candles: 6
-  # No-trade windows: block ALL entries during specified time ranges (HH:MM IST).
-  # Lunch hour (11:00-13:00) is institutionally dead — choppy, low conviction.
-  # Add more windows as a list of {start, end} pairs if needed.
-  no_trade_windows:
-    - { start: "11:00", end: "13:00" }   # Lunch dead zone
+  # No-trade windows are now strategy-specific (see scalping.no_trade_windows
+  # and ichimoku.no_trade_windows below). This shared key is kept as a fallback
+  # for any future strategy that does not declare its own windows.
+  no_trade_windows: []
 
 stop_loss:
   trailing:

@@ -812,10 +812,15 @@ class TradingEngine:
             pass  # malformed config — allow entry rather than blocking
 
         # --- No-trade window filter: block entries during configured time ranges ---
-        # Handles lunch hour (11:00-13:00) and any other dead zones in settings.yaml.
-        # Applies to ALL strategies. Uses candle_ts_raw already resolved above.
+        # Strategy-specific windows take priority (e.g. scalping blocks lunch,
+        # Ichimoku does not). Falls back to trade_rules.no_trade_windows if the
+        # active strategy has no windows declared.
         try:
-            no_trade_windows = config.get("trade_rules.no_trade_windows", [])
+            _strategy_windows = config.get(f"{self.strategy.name}.no_trade_windows", None)
+            no_trade_windows = (
+                _strategy_windows if _strategy_windows is not None
+                else config.get("trade_rules.no_trade_windows", [])
+            )
             for _window in no_trade_windows:
                 _ws_hh, _ws_mm = str(_window.get("start", "00:00")).split(":")
                 _we_hh, _we_mm = str(_window.get("end",   "00:00")).split(":")
