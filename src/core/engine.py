@@ -22,9 +22,7 @@ from typing import Optional
 import pandas as pd
 
 from src.broker.base import BrokerBase
-from src.broker.kite_broker import KiteBroker
-from src.broker.kite_ticker import TickerManager
-from src.broker.paper_broker import PaperBroker
+from src.broker.broker_factory import create_broker, create_ticker
 from src.core.candle_builder import CandleAggregator
 from src.core.market_regime import MarketRegime, MarketRegimeFilter
 from src.utils.system_logger import sys_log, EVENT_CONNECTED, EVENT_DISCONNECTED, EVENT_HALT, EVENT_KILL_SWITCH, EVENT_STARTUP, EVENT_SHUTDOWN, EVENT_CONFIG_RELOAD
@@ -44,13 +42,15 @@ from src.strategy.two_candle import PositionalTrendFilter
 from src.utils.config_loader import config
 from src.utils.logger import get_logger
 from src.utils.market_calendar import (
-    IST,
+    market_tz,
     is_market_open,
     is_square_off_time,
     is_trading_day,
     last_trading_day,
     market_close_time,
+    market_close_time_naive,
     market_open_time,
+    market_open_time_naive,
     now_ist,
 )
 from src.utils.trade_logger import TradeLogger
@@ -95,7 +95,7 @@ class TradingEngine:
         self._underlying_token: Optional[int] = None  # NSE index — for LTP display / ATM
         self._futures_symbol: Optional[str] = None    # NFO futures — for candle building (has volume)
         self._candle_token: Optional[int] = None      # token used for candle building; set to futures if available
-        self._ticker: Optional[TickerManager] = None
+        self._ticker = None   # TickerManager (India) or AlpacaTicker (US)
         # Candle aggregator interval comes from the strategy — switches automatically.
         self._candle_agg = CandleAggregator(interval_minutes=self.strategy.timeframe_minutes)
         self._candle_agg.on_candle_close(self._on_candle_close)
@@ -136,11 +136,7 @@ class TradingEngine:
     # Broker init
     # ------------------------------------------------------------------
     def _init_broker(self) -> BrokerBase:
-        if config.is_paper_mode():
-            log.info("Starting in PAPER trading mode.")
-            return PaperBroker()
-        log.info("Starting in LIVE trading mode.")
-        return KiteBroker()
+        return create_broker()
 
     # ------------------------------------------------------------------
     # Connection
@@ -157,9 +153,9 @@ class TradingEngine:
     # Historical data (REST — used for warmup and positional filter)
     # ------------------------------------------------------------------
     def fetch_candles(self, interval: str, lookback_minutes: int = 120) -> pd.DataFrame:
-        to_dt = now_ist().replace(tzinfo=None)
+        to_dt   = now_ist().replace(tzinfo=None)
         from_dt = to_dt - timedelta(minutes=lookback_minutes)
-        symbol = "NIFTY BANK" if self.underlying == "BANKNIFTY" else "NIFTY 50"
+        symbol  = self.broker.get_seed_symbol(self.underlying)
         return self.broker.get_historical_candles(symbol, interval, from_dt, to_dt)
 
     def prepare_candles(
@@ -205,12 +201,8 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # Instrument token resolution (shared between KiteBroker & PaperBroker)
     # ------------------------------------------------------------------
-    def _get_instrument_token(self, symbol: str, exchange: str = "NFO") -> Optional[int]:
-        if isinstance(self.broker, KiteBroker):
-            return self.broker.get_instrument_token(symbol, exchange)
-        if isinstance(self.broker, PaperBroker):
-            return self.broker._kite.get_instrument_token(symbol, exchange)
-        return None
+    def _get_instrument_token(self, symbol: str, exchange: str = "") -> Optional[int]:
+        return self.broker.get_instrument_token(symbol, exchange)
 
     # ------------------------------------------------------------------
     # Entry / exit execution
@@ -315,7 +307,7 @@ class TradingEngine:
         )
 
         # Subscribe option token for tick-level SL monitoring
-        opt_token = self._get_instrument_token(symbol, "NFO")
+        opt_token = self._get_instrument_token(symbol, self.exchange)
         if opt_token and self._ticker is not None:
             with self._engine_lock:
                 self._option_token_to_trade[opt_token] = trade
@@ -357,7 +349,7 @@ class TradingEngine:
             max_consec = int(config.get("trade_rules.max_consecutive_losses", 2))
             pause_candles = int(config.get("trade_rules.consecutive_loss_pause_candles", 6))
             if self._consecutive_losses >= max_consec:
-                pause_min = pause_candles * 3   # 3-min candles
+                pause_min = pause_candles * self.strategy.timeframe_minutes
                 self._consec_loss_pause_until = now_ist() + timedelta(minutes=pause_min)
                 log.warning(
                     f"Circuit breaker: {self._consecutive_losses} consecutive losses — "
@@ -383,7 +375,7 @@ class TradingEngine:
         self._cleanup_option_subscription(trade.symbol)
 
         self._cooldown_until = now_ist() + timedelta(
-            minutes=self.cooldown_candles * 3
+            minutes=self.cooldown_candles * self.strategy.timeframe_minutes
         )
 
     def _cleanup_option_subscription(self, symbol: str) -> None:
@@ -401,60 +393,45 @@ class TradingEngine:
     # Futures resolution + smart historical seed
     # ------------------------------------------------------------------
     def _resolve_futures_symbol(self) -> None:
-        """Resolve the nearest-expiry BankNifty futures symbol and instrument token.
+        """Resolve the nearest-expiry futures symbol and instrument token.
 
-        Sets self._futures_symbol and self._candle_token.
-        Falls back gracefully — if futures are unavailable, candle building
-        continues on the index token (no volume, but OHLC still works).
+        India: BankNifty futures carry real volume — use them for candle building.
+        US:    SPY ETF ticks include native volume — no futures needed.
         """
-        resolve_fn = getattr(self.broker, "get_current_month_futures_symbol", None)
-        if resolve_fn is None:
-            log.warning("Broker does not support futures symbol resolution — index will be used for candles.")
+        if config.active_market() == "us":
+            log.info("US market — no futures subscription needed (SPY ETF has native volume).")
             return
 
-        self._futures_symbol = resolve_fn(self.underlying)
+        self._futures_symbol = self.broker.get_current_month_futures_symbol(self.underlying)
         if not self._futures_symbol:
             log.warning("No active futures contract found — index will be used for candle building (no volume).")
             return
 
-        self._candle_token = self._get_instrument_token(self._futures_symbol, "NFO")
+        self._candle_token = self._get_instrument_token(self._futures_symbol, "NFO")  # India: NFO exchange
         if self._candle_token:
             log.info(f"Candle token set to futures: {self._futures_symbol} (token={self._candle_token})")
         else:
-            log.warning(f"Could not resolve token for {self._futures_symbol} — index will be used for candles.")
+            log.warning(f"Could not resolve token for {self._futures_symbol} — index used for candles.")
             self._futures_symbol = None
 
     def _smart_seed_candles(self) -> Optional[pd.DataFrame]:
         """Smart historical seed for indicator warmup.
 
-        Strategy (as requested):
-        - Always: last 45 min of the most recent completed trading session
-          (14:45 – 15:30).  Correctly handles Monday → fetches Friday's tail;
-          no fixed-hour lookback that would fail across weekends.
-        - Additionally when market is currently open: today's session from
-          09:15 to now (so a mid-session restart gets full today context).
-
-        Uses BankNifty futures symbol when available (has real volume).
-        Falls back to the index if futures resolution failed.
+        Fetches the tail of the most recent completed session, plus today's
+        session if market is currently open. Works for both India and US markets
+        using config-driven session times.
         """
-        from datetime import time as dtime
+        mtz          = market_tz()
+        fetch_symbol = self._futures_symbol   # India: futures; US: None → ETF directly
 
-        ist          = IST
-        fetch_symbol = self._futures_symbol   # None → falls back to index
+        prev_day    = last_trading_day()
+        seed_min    = self.strategy.seed_lookback_minutes
+        session_end = market_close_time_naive()   # 15:30 India / 16:00 US (no tzinfo)
 
-        prev_day = last_trading_day()   # Mon→Fri, Tue→Mon, etc.
-
-        # Fetch the tail of the previous session.
-        # The lookback window is strategy-specific:
-        #   scalping  →  90 min  (14:45 – 15:30 on 3-min → ~30 candles, ample for SuperTrend)
-        #   ichimoku  → 120 min  (13:30 – 15:30 on 1-min → 120 candles, covers Senkou B 52-period)
-        seed_min  = self.strategy.seed_lookback_minutes
-        session_end = dtime(15, 30)
         prev_from = (
-            datetime.combine(prev_day, session_end, tzinfo=ist)
-            - timedelta(minutes=seed_min)
+            datetime.combine(prev_day, session_end, tzinfo=mtz) - timedelta(minutes=seed_min)
         ).replace(tzinfo=None)
-        prev_to = datetime.combine(prev_day, session_end, tzinfo=ist).replace(tzinfo=None)
+        prev_to = datetime.combine(prev_day, session_end, tzinfo=mtz).replace(tzinfo=None)
 
         frames: list[pd.DataFrame] = []
 
@@ -462,28 +439,29 @@ class TradingEngine:
         if df_prev is not None and not df_prev.empty:
             frames.append(df_prev)
             start_str = (
-                datetime.combine(prev_day, session_end, tzinfo=ist)
-                - timedelta(minutes=seed_min)
+                datetime.combine(prev_day, session_end, tzinfo=mtz) - timedelta(minutes=seed_min)
             ).strftime("%H:%M")
             log.info(
                 f"Smart seed: {len(df_prev)} candles from {prev_day} "
-                f"({start_str}–15:30, {self.strategy.timeframe_str})"
+                f"({start_str}–{session_end.strftime('%H:%M')}, {self.strategy.timeframe_str})"
             )
         else:
             log.warning(
-                f"Smart seed: no candles for {prev_day} tail — Kite API may be unavailable."
+                f"Smart seed: no candles for {prev_day} tail — broker API may be unavailable."
             )
 
-        # If market is open right now, also include today's session from 09:15 to now
+        # If market is open right now, also include today's session from market open to now
         if is_market_open():
-            today      = now_ist().date()
-            today_from = datetime.combine(today, dtime(9, 15), tzinfo=ist).replace(tzinfo=None)
-            today_to   = now_ist().replace(tzinfo=None)
-            df_today   = self._fetch_seed_candles(fetch_symbol, today_from, today_to)
+            today        = now_ist().date()
+            session_open = market_open_time_naive()
+            today_from   = datetime.combine(today, session_open, tzinfo=mtz).replace(tzinfo=None)
+            today_to     = now_ist().replace(tzinfo=None)
+            df_today     = self._fetch_seed_candles(fetch_symbol, today_from, today_to)
             if df_today is not None and not df_today.empty:
                 frames.append(df_today)
                 log.info(
-                    f"Smart seed: {len(df_today)} candles from today's session (09:15 – now)"
+                    f"Smart seed: {len(df_today)} candles from today's session "
+                    f"({session_open.strftime('%H:%M')} – now)"
                 )
 
         if not frames:
@@ -524,62 +502,66 @@ class TradingEngine:
         if symbol:
             df = self.broker.get_historical_candles(symbol, interval, from_dt, to_dt)
         else:
-            index_sym = "NIFTY BANK" if self.underlying == "BANKNIFTY" else "NIFTY 50"
-            df = self.broker.get_historical_candles(index_sym, interval, from_dt, to_dt)
+            seed_sym = self.broker.get_seed_symbol(self.underlying)
+            df = self.broker.get_historical_candles(seed_sym, interval, from_dt, to_dt)
         return df if df is not None and not df.empty else None
 
     # ------------------------------------------------------------------
     # WebSocket event handlers
     # ------------------------------------------------------------------
     def _setup_websocket(self) -> bool:
-        """Resolve underlying token, create and wire up TickerManager."""
-        creds = config.credentials.get("kite", {})
-        api_key = creds.get("api_key", "")
-        access_token = creds.get("access_token", "")
-        if not api_key or not access_token:
-            log.error("Cannot start WebSocket: missing kite.api_key / access_token in credentials.yaml")
-            return False
+        """Resolve underlying token, create and wire up the market-appropriate ticker."""
+        market = config.active_market()
 
-        index_sym = "NIFTY BANK" if self.underlying == "BANKNIFTY" else "NIFTY 50"
-        self._underlying_token = self._get_instrument_token(index_sym, "NSE")
-        if not self._underlying_token:
-            log.error(f"Could not resolve instrument token for {index_sym}")
-            return False
+        if market == "india":
+            # India: underlying token is the NSE index (display/ATM); candles come from futures
+            index_sym = self.broker.get_seed_symbol(self.underlying)
+            self._underlying_token = self._get_instrument_token(index_sym, "NSE")
+            if not self._underlying_token:
+                log.error(f"Could not resolve instrument token for {index_sym}")
+                return False
+        else:
+            # US: underlying is the ETF itself (SPY) — has native volume and price
+            self._underlying_token = self._get_instrument_token(self.underlying, self.exchange)
+            if not self._underlying_token:
+                log.error(f"Could not resolve token for {self.underlying}")
+                return False
 
-        self._ticker = TickerManager(api_key, access_token)
+        self._ticker = create_ticker(self.broker)
         self._ticker.on_ticks(self._on_ticks)
         self._ticker.on_connect(self._on_ws_connect)
         self._ticker.on_close(self._on_ws_close)
         self._ticker.on_error(self._on_ws_error)
 
-        # Subscribe index token — used only for live LTP / ATM display
         self._ticker.subscribe([self._underlying_token], mode="full")
 
-        # Subscribe futures token for candle building (has real volume).
-        # _futures_symbol / _candle_token were resolved in _resolve_futures_symbol()
-        # before the seed call; just subscribe here.
-        if self._candle_token and self._candle_token != self._underlying_token:
-            self._ticker.subscribe([self._candle_token], mode="full")
-            log.info(
-                f"Subscribed {self._futures_symbol} (token={self._candle_token}) "
-                f"for candle building with real volume"
-            )
-        else:
-            # Fallback: no futures — use index for candles (volume will be 0)
-            self._candle_token = self._underlying_token
-            log.warning("No futures token — index will be used for candle building (no volume).")
+        if market == "india":
+            # Subscribe futures token for candle building with real volume
+            if self._candle_token and self._candle_token != self._underlying_token:
+                self._ticker.subscribe([self._candle_token], mode="full")
+                log.info(
+                    f"Subscribed {self._futures_symbol} (token={self._candle_token}) "
+                    f"for candle building with real volume"
+                )
+            else:
+                self._candle_token = self._underlying_token
+                log.warning("No futures token — index will be used for candle building (no volume).")
 
-        # Resolve India VIX token for the regime gate (ltp mode is enough)
-        self._vix_token = self._get_instrument_token("INDIA VIX", "NSE")
-        if self._vix_token:
-            self._ticker.subscribe([self._vix_token], mode="ltp")
-            log.info(f"Subscribed India VIX (token={self._vix_token}) for regime gate")
+            # India VIX for market regime gate
+            self._vix_token = self._get_instrument_token("INDIA VIX", "NSE")
+            if self._vix_token:
+                self._ticker.subscribe([self._vix_token], mode="ltp")
+                log.info(f"Subscribed India VIX (token={self._vix_token}) for regime gate")
+            else:
+                log.warning("India VIX token not found — regime gate bypassed (fail-open)")
         else:
-            log.warning("India VIX token not found — regime gate will be bypassed (fail-open)")
+            # US: ETF IS the candle source; no VIX subscription needed
+            self._candle_token = self._underlying_token
 
         log.info(
-            f"WebSocket configured. Index token: {self._underlying_token} | "
-            f"Candle token: {self._candle_token} ({self._futures_symbol or 'index fallback'})"
+            f"WebSocket configured [{market.upper()}]. "
+            f"Underlying token: {self._underlying_token} | "
+            f"Candle token: {self._candle_token}"
         )
         return True
 
@@ -762,7 +744,7 @@ class TradingEngine:
             df_snapshot = df.copy()
 
         log.info(
-            f"3-min candle closed @ {candle.name} | "
+            f"{self.strategy.timeframe_minutes}-min candle closed @ {candle.name} | "
             f"C={candle['close']:.2f} V={candle['volume']:.0f} | "
             f"open_trades={len(state.open_trades)}"
         )
@@ -795,7 +777,7 @@ class TradingEngine:
         # Price discovery in 09:15-09:30 is too noisy for reliable signals.
         # Configured via trade_rules.no_entry_before (HH:MM IST).
         try:
-            no_entry_before_str = str(config.get("trade_rules.no_entry_before", "09:30"))
+            no_entry_before_str = str(config.get("session.no_entry_before", "09:30"))
             _ef_hh, _ef_mm = no_entry_before_str.split(":")
             candle_ts_raw = candle.name
             if hasattr(candle_ts_raw, "to_pydatetime"):
@@ -1009,11 +991,13 @@ class TradingEngine:
     # ------------------------------------------------------------------
     def run(self, poll_interval_sec: int = 5) -> None:
         """Seed historical data, start WebSocket streaming, block until shutdown."""
+        market   = config.active_market().upper()
+        currency = "$" if config.active_market() == "us" else "₹"
         log.info("=" * 60)
-        log.info("Siva Scalping Bot starting up (WebSocket mode)")
-        log.info(f"Mode: {state.mode.upper()}")
-        log.info(f"Daily budget: ₹{state.daily_budget:,.2f}")
-        log.info(f"Underlying: {self.underlying}")
+        log.info(f"Siva Scalping Bot starting up [{market}] (WebSocket mode)")
+        log.info(f"Mode: {state.mode.upper()} | Strategy: {self.strategy.name}")
+        log.info(f"Daily budget: {currency}{state.daily_budget:,.2f}")
+        log.info(f"Underlying: {self.underlying} | Exchange: {self.exchange}")
         log.info("=" * 60)
 
         if not self.connect():
@@ -1031,7 +1015,7 @@ class TradingEngine:
         # ------------------------------------------------------------------
         pre_open_min = int(config.get("session.ws_pre_open_minutes", 15))
         ws_start_time = (
-            datetime.combine(now_ist().date(), market_open_time(), tzinfo=IST)
+            datetime.combine(now_ist().date(), market_open_time(), tzinfo=market_tz())
             - timedelta(minutes=pre_open_min)
         )
         now = now_ist()
@@ -1090,7 +1074,7 @@ class TradingEngine:
             return
 
         if not self._ticker.start():
-            log.error("KiteTicker failed to start. Falling back to REST-poll mode.")
+            log.error("Ticker WebSocket failed to start. Falling back to REST-poll mode.")
             self._run_poll_fallback(poll_interval_sec)
             return
 
@@ -1116,7 +1100,7 @@ class TradingEngine:
         def _market_close_watcher() -> None:
             post_close_min = int(config.get("session.ws_post_close_minutes", 15))
             stop_at = (
-                datetime.combine(now_ist().date(), market_close_time(), tzinfo=IST)
+                datetime.combine(now_ist().date(), market_close_time(), tzinfo=market_tz())
                 + timedelta(minutes=post_close_min)
             )
             log.info(

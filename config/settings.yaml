@@ -8,8 +8,73 @@
 
 mode:
   # "paper" = simulate trades with live prices, no real orders
-  # "live"  = place real orders via Kite Connect API
+  # "live"  = place real orders (Kite for India, Alpaca for US)
   trading_mode: paper
+
+# ----------------------------------------------------------
+# Active market — change this ONE line to switch markets
+# ----------------------------------------------------------
+#   india  → BankNifty CE/PE options via Zerodha Kite (IST session)
+#   us     → SPY CE/PE options via Alpaca (ET session)
+#
+# Each market block below overrides: broker, timezone, instrument,
+# session, and capital. All shared settings (strategy, risk, SL,
+# trade_rules) remain identical so results are directly comparable.
+# ----------------------------------------------------------
+active_market: india   # india | us
+
+markets:
+  india:
+    broker: zerodha          # zerodha | paper (overridden by mode.trading_mode)
+    timezone: Asia/Kolkata
+    instrument:
+      symbol: BANKNIFTY
+      exchange: NFO
+      lot_size: 15
+      max_lots_per_trade: 3
+      strike_type: ATM
+      expiry_type: current_week
+      strike_step: 100       # BankNifty strikes in ₹100 increments
+    session:
+      market_open:  "09:15"
+      market_close: "15:30"
+      square_off_time: "15:20"
+      no_entry_before: "09:30"
+      ws_pre_open_minutes: 15
+      ws_post_close_minutes: 15
+    capital:
+      daily_budget: 100000   # INR
+      max_daily_loss_pct: 1.0
+      allocation:
+        strong: 30
+        medium: 20
+        weak: 0
+
+  us:
+    broker: alpaca           # alpaca | paper (overridden by mode.trading_mode)
+    timezone: America/New_York
+    instrument:
+      symbol: SPY
+      exchange: OPRA
+      lot_size: 100          # US options: 100 shares per contract
+      max_lots_per_trade: 3
+      strike_type: ATM
+      expiry_type: 0dte      # 0dte (same-day) | weekly (next Friday)
+      strike_step: 1         # SPY strikes in $1 increments
+    session:
+      market_open:  "09:30"
+      market_close: "16:00"
+      square_off_time: "15:45"
+      no_entry_before: "09:40"
+      ws_pre_open_minutes: 15
+      ws_post_close_minutes: 15
+    capital:
+      daily_budget: 10000    # USD
+      max_daily_loss_pct: 1.0
+      allocation:
+        strong: 30
+        medium: 20
+        weak: 0
 
 # ----------------------------------------------------------
 # Strategy selection
@@ -25,46 +90,12 @@ mode:
 strategy:
   type: ichimoku   # scalping | ichimoku
 
-capital:
-  # Maximum capital allocated for the day (INR)
-  # NO leverage is used. This is your hard cap on premium outflow.
-  daily_budget: 100000
-
-  # Maximum loss allowed per day as % of daily_budget (1% = stop trading)
-  max_daily_loss_pct: 1.0
-
-  # Signal-strength based capital allocation (% of daily_budget per trade)
-  allocation:
-    strong: 30    # all 6 conditions + volume spike >= 1.5x
-    medium: 20    # 5 of 6 conditions met
-    weak: 0       # disabled per user requirement
-
-instrument:
-  # Trading instrument
-  symbol: BANKNIFTY
-  exchange: NFO
-  lot_size: 15
-  max_lots_per_trade: 3
-
-  # Strike selection
-  strike_type: ATM          # ATM | ITM_1 | OTM_1
-  expiry_type: current_week # current_week | next_week | monthly
-
 timeframe:
   # NOTE: the primary candle timeframe is now declared by each strategy
   # (scalping.timeframe / ichimoku.timeframe). This section keeps only
   # the shared positional-filter and warmup settings.
   positional: 15minute        # 15-min chart used by the positional trend filter
   warmup_candles: 1           # completed candles required before first entry
-
-session:
-  market_open:  "09:15"
-  market_close: "15:30"
-  # Square off all positions at this time (10 min before close)
-  square_off_time: "15:20"
-  # WebSocket lifecycle window
-  ws_pre_open_minutes: 15     # WS starts this many minutes BEFORE market open  (09:00 IST)
-  ws_post_close_minutes: 15   # WS auto-stops this many minutes AFTER close     (15:45 IST)
 
 # ----------------------------------------------------------
 # Scalping strategy parameters  (used when strategy.type = scalping)
@@ -162,9 +193,6 @@ trade_rules:
   max_open_positions: 1
   # Minimum time between trades (seconds) to avoid rapid re-fire
   min_time_between_trades_sec: 30
-  # Early session filter: skip entry signals before this time (HH:MM IST).
-  # First 15 min after open (09:15-09:30) are pure price discovery — too noisy.
-  no_entry_before: "09:30"
   # Consecutive loss circuit breaker: pause entries for N candles after this many
   # consecutive losing trades (SL/flip exits in a row). Resets on a winning trade.
   max_consecutive_losses: 2

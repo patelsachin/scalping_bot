@@ -65,6 +65,11 @@ class KiteBroker(BrokerBase):
             log.error(f"Failed to load instruments for {exchange}: {e}")
             return pd.DataFrame()
 
+    def get_seed_symbol(self, underlying: str) -> str:
+        """Map BankNifty/Nifty to Kite's index names for historical data."""
+        _map = {"BANKNIFTY": "NIFTY BANK", "NIFTY": "NIFTY 50"}
+        return _map.get(underlying, underlying)
+
     def get_instrument_token(self, tradingsymbol: str, exchange: str = "NFO") -> Optional[int]:
         df = self._load_instruments(exchange)
         if df.empty:

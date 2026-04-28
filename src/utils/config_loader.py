@@ -9,7 +9,13 @@ import yaml
 
 
 class Config:
-    """Singleton config loader - loads settings.yaml and credentials.yaml."""
+    """Singleton config loader - loads settings.yaml and credentials.yaml.
+
+    After loading, the active market's config block (markets.india or markets.us)
+    is deep-merged into the top-level settings so that existing code using
+    config.get("instrument.symbol"), config.get("session.market_open"), etc.
+    continues to work unchanged regardless of which market is active.
+    """
 
     _instance: "Config | None" = None
     _settings: dict[str, Any] = {}
@@ -38,10 +44,30 @@ class Config:
             with open(creds_path, "r", encoding="utf-8") as f:
                 self._credentials = yaml.safe_load(f) or {}
         else:
-            # Credentials optional for paper mode
             self._credentials = {}
 
         self._project_root = project_root
+        self._merge_active_market()
+
+    def _merge_active_market(self) -> None:
+        """Deep-merge the active market block into top-level settings.
+
+        markets.india (or markets.us) keys override top-level defaults so
+        that config.get("instrument.symbol"), config.get("session.market_open")
+        etc. automatically return the right values for the selected market.
+        """
+        active = self._settings.get("active_market", "india")
+        markets = self._settings.get("markets", {})
+        market_cfg = markets.get(active, {})
+        if not market_cfg:
+            return
+
+        for key, value in market_cfg.items():
+            if isinstance(value, dict) and isinstance(self._settings.get(key), dict):
+                # Deep merge: market overrides individual sub-keys
+                self._settings[key] = {**self._settings.get(key, {}), **value}
+            else:
+                self._settings[key] = value
 
     @property
     def settings(self) -> dict[str, Any]:
@@ -65,6 +91,9 @@ class Config:
             else:
                 return default
         return node
+
+    def active_market(self) -> str:
+        return self._settings.get("active_market", "india")
 
     def is_paper_mode(self) -> bool:
         return self.get("mode.trading_mode", "paper").lower() == "paper"
