@@ -42,15 +42,12 @@ from src.strategy.two_candle import PositionalTrendFilter
 from src.utils.config_loader import config
 from src.utils.logger import get_logger
 from src.utils.market_calendar import (
-    market_tz,
     is_market_open,
     is_square_off_time,
     is_trading_day,
     last_trading_day,
     market_close_time,
-    market_close_time_naive,
     market_open_time,
-    market_open_time_naive,
     now_ist,
 )
 from src.utils.trade_logger import TradeLogger
@@ -153,7 +150,7 @@ class TradingEngine:
     # Historical data (REST — used for warmup and positional filter)
     # ------------------------------------------------------------------
     def fetch_candles(self, interval: str, lookback_minutes: int = 120) -> pd.DataFrame:
-        to_dt   = now_ist().replace(tzinfo=None)
+        to_dt   = now_ist()
         from_dt = to_dt - timedelta(minutes=lookback_minutes)
         symbol  = self.broker.get_seed_symbol(self.underlying)
         return self.broker.get_historical_candles(symbol, interval, from_dt, to_dt)
@@ -422,17 +419,14 @@ class TradingEngine:
         session if market is currently open. Works for both India and US markets
         using config-driven session times.
         """
-        mtz          = market_tz()
         fetch_symbol = self._futures_symbol   # India: futures; US: None → ETF directly
 
         prev_day    = last_trading_day()
         seed_min    = self.strategy.seed_lookback_minutes
-        session_end = market_close_time_naive()   # 15:30 India / 16:00 US (no tzinfo)
+        session_end = market_close_time()   # 15:30 India / 16:00 US
 
-        prev_from = (
-            datetime.combine(prev_day, session_end, tzinfo=mtz) - timedelta(minutes=seed_min)
-        ).replace(tzinfo=None)
-        prev_to = datetime.combine(prev_day, session_end, tzinfo=mtz).replace(tzinfo=None)
+        prev_from = datetime.combine(prev_day, session_end) - timedelta(minutes=seed_min)
+        prev_to   = datetime.combine(prev_day, session_end)
 
         frames: list[pd.DataFrame] = []
 
@@ -440,7 +434,7 @@ class TradingEngine:
         if df_prev is not None and not df_prev.empty:
             frames.append(df_prev)
             start_str = (
-                datetime.combine(prev_day, session_end, tzinfo=mtz) - timedelta(minutes=seed_min)
+                datetime.combine(prev_day, session_end) - timedelta(minutes=seed_min)
             ).strftime("%H:%M")
             log.info(
                 f"Smart seed: {len(df_prev)} candles from {prev_day} "
@@ -454,9 +448,9 @@ class TradingEngine:
         # If market is open right now, also include today's session from market open to now
         if is_market_open():
             today        = now_ist().date()
-            session_open = market_open_time_naive()
-            today_from   = datetime.combine(today, session_open, tzinfo=mtz).replace(tzinfo=None)
-            today_to     = now_ist().replace(tzinfo=None)
+            session_open = market_open_time()
+            today_from   = datetime.combine(today, session_open)
+            today_to     = now_ist()
             df_today     = self._fetch_seed_candles(fetch_symbol, today_from, today_to)
             if df_today is not None and not df_today.empty:
                 frames.append(df_today)
@@ -578,7 +572,7 @@ class TradingEngine:
         raw_ts = tick.get("exchange_timestamp")
         if isinstance(raw_ts, datetime):
             ts_naive = raw_ts.replace(tzinfo=None) if raw_ts.tzinfo else raw_ts
-            age_s = (now_ist().replace(tzinfo=None) - ts_naive).total_seconds()
+            age_s = (now_ist() - ts_naive).total_seconds()
             if age_s > 3:
                 log.debug(f"Tick rejected: stale {age_s:.1f}s token={tick.get('instrument_token')}")
                 return False
@@ -1016,7 +1010,7 @@ class TradingEngine:
         # ------------------------------------------------------------------
         pre_open_min = int(config.get("session.ws_pre_open_minutes", 15))
         ws_start_time = (
-            datetime.combine(now_ist().date(), market_open_time(), tzinfo=market_tz())
+            datetime.combine(datetime.now().date(), market_open_time())
             - timedelta(minutes=pre_open_min)
         )
         now = now_ist()
@@ -1024,7 +1018,7 @@ class TradingEngine:
             wait_sec = (ws_start_time - now).total_seconds()
             log.info(
                 f"Started early — WebSocket will begin at "
-                f"{ws_start_time.strftime('%H:%M:%S')} IST "
+                f"{ws_start_time.strftime('%H:%M:%S')} local "
                 f"({wait_sec / 60:.0f} min from now). Sleeping..."
             )
             _last_log_min = -1
@@ -1037,7 +1031,7 @@ class TradingEngine:
                 if remaining_min != _last_log_min:
                     log.info(
                         f"Pre-market wait: {remaining_min} min until WebSocket start "
-                        f"({ws_start_time.strftime('%H:%M')} IST)."
+                        f"({ws_start_time.strftime('%H:%M')} local)."
                     )
                     _last_log_min = remaining_min
                 time.sleep(5)
@@ -1101,12 +1095,12 @@ class TradingEngine:
         def _market_close_watcher() -> None:
             post_close_min = int(config.get("session.ws_post_close_minutes", 15))
             stop_at = (
-                datetime.combine(now_ist().date(), market_close_time(), tzinfo=market_tz())
+                datetime.combine(datetime.now().date(), market_close_time())
                 + timedelta(minutes=post_close_min)
             )
             log.info(
                 f"Market-close watcher active — WebSocket will auto-stop at "
-                f"{stop_at.strftime('%H:%M:%S')} IST."
+                f"{stop_at.strftime('%H:%M:%S')} local."
             )
             while not self._shutdown.is_set():
                 if now_ist() >= stop_at:

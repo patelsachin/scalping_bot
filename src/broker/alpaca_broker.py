@@ -171,10 +171,12 @@ class AlpacaBroker(BrokerBase):
                 start=from_dt,
                 end=to_dt,
                 adjustment="raw",
-                feed="iex",
             )
             bars_resp = self._stock_client.get_stock_bars(req)
-            bars = bars_resp.get(symbol, [])
+            try:
+                bars = bars_resp[symbol]
+            except (KeyError, TypeError):
+                bars = []
             if not bars:
                 return pd.DataFrame()
 

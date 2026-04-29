@@ -106,8 +106,14 @@ class AlpacaTicker:
             log.error("alpaca-py not installed. Run: pip install alpaca-py")
             return False
 
-        feed = "iex"  # free tier; change to "sip" for consolidated (paid)
-        self._stock_stream  = StockDataStream(self._api_key, self._secret_key, feed=feed)
+        # Feed must be a Feed enum — passing a plain string causes AttributeError on .value
+        try:
+            from alpaca.data.enums import Feed
+            feed = Feed.IEX   # free tier; use Feed.SIP for consolidated (paid)
+            self._stock_stream = StockDataStream(self._api_key, self._secret_key, feed=feed)
+        except (ImportError, AttributeError):
+            # Older alpaca-py builds — omit feed, defaults to IEX
+            self._stock_stream = StockDataStream(self._api_key, self._secret_key)
         self._option_stream = OptionDataStream(self._api_key, self._secret_key)
 
         # Subscribe initial stock symbols
